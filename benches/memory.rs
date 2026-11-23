@@ -93,6 +93,9 @@ fn main() {
     let mut rows = Vec::new();
     for (fixture, text) in fixtures() {
         let (doc, p) = measure(|| parse(&text, None));
+        // Read the self-accounting before any other copy exists: shared strings are divided among
+        // live references, so a live clone or decoded copy would halve their attributed bytes.
+        let ijson_mem_allocated = doc.mem_allocated();
         let (clone, c) = measure(|| doc.clone());
         drop(clone);
         let (_out, s) = measure(|| serde_json::to_vec(&doc).unwrap());
@@ -108,7 +111,7 @@ fn main() {
             parse_peak: p.peak_mem(),
             parse_retained: p.mem_leaked(),
             parse_allocs: p.num_allocs(),
-            ijson_mem_allocated: doc.mem_allocated(),
+            ijson_mem_allocated,
             clone_peak: c.peak_mem(),
             clone_retained: c.mem_leaked(),
             serialise_compact_peak: s.peak_mem(),

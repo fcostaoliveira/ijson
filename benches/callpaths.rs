@@ -218,10 +218,25 @@ fn bench_lookup(c: &mut Criterion) {
     let biz = biz.into_object().unwrap();
     g.bench_function("business-22-hit", |b| b.iter(|| black_box(biz.get("review_count"))));
     g.bench_function("business-22-miss", |b| b.iter(|| black_box(biz.get("not_there"))));
-    // Array index on a 1024-element typed array (ArraySliceRef access)
+    // Array index on a 1024-element typed array. `IArray::get` returns `None` for typed arrays;
+    // RedisJSON reads elements through `ArraySliceRef` (`as_slice`), so that is what is timed. The
+    // indices go through `black_box` so the reads cannot be hoisted out of the loop. One read is
+    // ~0.6 ns, below what the timer can judge, so each iteration performs 64 strided reads.
     let floats = parse(&float_array_json(1024), None);
     let arr = floats.as_array().unwrap();
-    g.bench_function("typed-array-get-f64", |b| b.iter(|| black_box(arr.get(777))));
+    let mut idx = 0usize;
+    g.bench_function("typed-array-slice-index-f64-x64", |b| {
+        b.iter(|| {
+            idx = (idx + 331) & 1023;
+            let s: &[f64] = arr.as_slice_of::<f64>().unwrap();
+            let base = black_box(idx);
+            let mut acc = 0.0;
+            for k in 0..64 {
+                acc += s[(base + k * 97) & 1023];
+            }
+            black_box(acc)
+        })
+    });
     g.finish();
 }
 
@@ -347,7 +362,8 @@ fn bench_typed_arrays(c: &mut Criterion) {
     let mut g = c.benchmark_group("typed");
     let mut lcg = Lcg(7);
     let floats: Vec<f64> = (0..1024).map(|_| (lcg.next() % 1_000_000) as f64 / 7.0).collect();
-    let ints: Vec<i64> = (0..1024).map(|_| (lcg.next() % 1_000_000) as i64 - 500_000).collect();
+    // 16 K elements: at 1 K the bulk copy takes ~100 ns and allocator jitter dominates the spread.
+    let ints: Vec<i64> = (0..16384).map(|_| (lcg.next() % 1_000_000) as i64 - 500_000).collect();
 
     g.bench_function("build-f64-push-1024", |b| {
         b.iter(|| {
@@ -358,7 +374,7 @@ fn bench_typed_arrays(c: &mut Criterion) {
             black_box(a)
         })
     });
-    g.bench_function("build-i64-try-extend-1024", |b| {
+    g.bench_function("build-i64-try-extend-16k", |b| {
         b.iter(|| {
             let mut a = IArray::new();
             a.try_extend(ints.iter().copied()).unwrap();
