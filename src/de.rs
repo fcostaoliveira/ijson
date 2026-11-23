@@ -320,17 +320,134 @@ impl<'de> Visitor<'de> for ArrayVisitor<'_> {
     {
         let mut arr = IArray::with_capacity(visitor.size_hint().unwrap_or(0))
             .map_err(|_| SError::custom("Failed to allocate array"))?;
-        while let Some(v) = visitor.next_element_seed(ValueVisitor {
+        while visitor
+            .next_element_seed(ArrayElemSeed {
+                arr: &mut arr,
+                fpha_config: self.fpha_config,
+                buffers: self.buffers.as_deref_mut(),
+            })?
+            .is_some()
+        {}
+        Ok(arr)
+    }
+}
+
+/// Seed for one array element. It appends the element to `arr` itself, so a float that fits the
+/// array's current `F64` storage is written without first being boxed into an `IValue`
+/// (`IArray::push_f64_direct`). Every other element is built by `ValueVisitor` and appended with
+/// the same `push` / `push_with_fp_type` calls as before, so tag selection is unchanged.
+struct ArrayElemSeed<'a> {
+    arr: &'a mut IArray,
+    fpha_config: Option<FPHAConfig>,
+    buffers: Option<&'a mut Vec<ObjectBuffer>>,
+}
+
+impl<'a> ArrayElemSeed<'a> {
+    fn value_visitor(&mut self) -> ValueVisitor<'_> {
+        ValueVisitor {
             fpha_config: self.fpha_config,
             buffers: self.buffers.as_deref_mut(),
-        })? {
-            match self.fpha_config {
-                Some(FPHAConfig { fpha_type }) => arr.push_with_fp_type(v, fpha_type),
-                None => arr.push(v).map_err(Into::into),
-            }
-            .map_err(|e| SError::custom(e.to_string()))?;
         }
-        Ok(arr)
+    }
+
+    fn push<E: SError>(self, v: IValue) -> Result<(), E> {
+        match self.fpha_config {
+            Some(FPHAConfig { fpha_type }) => self.arr.push_with_fp_type(v, fpha_type),
+            None => self.arr.push(v),
+        }
+        .map_err(|e| SError::custom(e.to_string()))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ArrayElemSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ArrayElemSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    #[inline]
+    fn visit_bool<E: SError>(self, value: bool) -> Result<(), E> {
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_i64<E: SError>(self, value: i64) -> Result<(), E> {
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_u64<E: SError>(self, value: u64) -> Result<(), E> {
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_f64<E: SError>(self, value: f64) -> Result<(), E> {
+        if self.fpha_config.is_none()
+            && self
+                .arr
+                .push_f64_direct(value)
+                .map_err(|e| SError::custom(e.to_string()))?
+        {
+            return Ok(());
+        }
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_str<E: SError>(self, value: &str) -> Result<(), E> {
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_string<E: SError>(self, value: String) -> Result<(), E> {
+        self.push(value.into())
+    }
+
+    #[inline]
+    fn visit_none<E: SError>(self) -> Result<(), E> {
+        self.push(IValue::NULL)
+    }
+
+    #[inline]
+    fn visit_some<D>(mut self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = self.value_visitor().deserialize(deserializer)?;
+        self.push(v)
+    }
+
+    #[inline]
+    fn visit_unit<E: SError>(self) -> Result<(), E> {
+        self.push(IValue::NULL)
+    }
+
+    fn visit_seq<V>(mut self, visitor: V) -> Result<(), V::Error>
+    where
+        V: SeqAccess<'de>,
+    {
+        let v = self.value_visitor().visit_seq(visitor)?;
+        self.push(v)
+    }
+
+    fn visit_map<V>(mut self, visitor: V) -> Result<(), V::Error>
+    where
+        V: MapAccess<'de>,
+    {
+        let v = self.value_visitor().visit_map(visitor)?;
+        self.push(v)
     }
 }
 
