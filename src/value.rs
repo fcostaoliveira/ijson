@@ -1294,10 +1294,11 @@ mod tests {
             assert!(matches!(x.clone().destructure_ref(), DestructuredRef::Object(u) if *u == o));
             assert!(matches!(x.clone().destructure_mut(), DestructuredMut::Object(u) if *u == o));
             // Layout: packed 8-byte header + KeyValuePair array + (only when cap > 8)
-            // a u32 hash table, padded to 8-byte alignment. Small objects carry no table.
+            // a bucket table (u32 index + u8 probe distance per bucket), padded to 8-byte
+            // alignment. Small objects carry no table.
             let cap = o.capacity() as usize;
             let table_bytes = if cap > 8 {
-                5 * cap / 4 * mem::size_of::<u32>()
+                5 * cap / 4 * crate::object::BUCKET_BYTES
             } else {
                 0
             };
