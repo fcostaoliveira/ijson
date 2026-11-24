@@ -261,42 +261,35 @@ fn bench_mutation(c: &mut Criterion) {
         .into_object()
         .unwrap();
 
-    // JSON.SET $.new_field "v" then JSON.DEL $.new_field on a ~22-key object
+    // JSON.SET $.new_field "v" then JSON.DEL $.new_field on a ~22-key object. The pair restores the
+    // object, so one object is mutated in place: an `iter_batched` setup clone would dominate the
+    // process (clone + drop of a ~22-key object is ~1 µs against a ~0.5 µs routine) and leave the
+    // routine's cache state to the setup.
+    let mut biz_mut = biz.clone();
     g.bench_function("object-insert-remove-22", |b| {
-        b.iter_batched(
-            || biz.clone(),
-            |mut o| {
-                o.insert("new_field", IValue::from("v")).unwrap();
-                black_box(o.remove("new_field"));
-                o
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            biz_mut.insert("new_field", IValue::from("v")).unwrap();
+            black_box(biz_mut.remove("new_field"))
+        })
     });
     // JSON.ARRAPPEND / JSON.ARRPOP on the heterogeneous businesses array (10 objects)
+    // Both pairs restore the array, so they mutate one array in place (same reasoning as above: a
+    // setup clone of 10 objects costs ~10 µs against a ~60 ns routine).
     let businesses = yelp.as_object().unwrap().get("businesses").unwrap().clone().into_array().unwrap();
+    let mut arr_push = businesses.clone();
     g.bench_function("array-push-pop-hetero", |b| {
-        b.iter_batched(
-            || businesses.clone(),
-            |mut a| {
-                a.push(IValue::from("appended")).unwrap();
-                black_box(a.pop());
-                a
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            arr_push.push(IValue::from("appended")).unwrap();
+            black_box(arr_push.pop())
+        })
     });
     // JSON.ARRINSERT at index 0 then JSON.ARRPOP 0
+    let mut arr_front = businesses.clone();
     g.bench_function("array-insert-front-remove", |b| {
-        b.iter_batched(
-            || businesses.clone(),
-            |mut a| {
-                a.insert(0, IValue::from("front")).unwrap();
-                black_box(a.remove(0));
-                a
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            arr_front.insert(0, IValue::from("front")).unwrap();
+            black_box(arr_front.remove(0))
+        })
     });
     // JSON.ARRTRIM: truncate a 1024-element typed array to half
     let ints = parse(&int_array_json(1024), None).into_array().unwrap();
