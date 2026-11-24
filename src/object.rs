@@ -1642,4 +1642,223 @@ mod tests {
             assert_eq!(x, IObject::new());
         }
     }
+
+    /// Keys of every representation: the empty key, inline keys (<= 7 bytes, including the
+    /// 7-byte boundary) and heap keys (8 bytes, the smallest heap string, and longer).
+    fn str_lookup_keys(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| match i % 5 {
+                0 if i == 0 => String::new(),
+                0 => format!("s{i:06}"),
+                1 => format!("k{i}"),
+                2 => format!("e{i:07}"),
+                3 => format!("heap_key_number_{i}"),
+                _ => format!("x{i}y"),
+            })
+            .collect()
+    }
+
+    /// `&str` lookups (`get`, `get_key_value`, `get_mut`, `contains_key`, `remove`) probe the
+    /// table with the borrowed bytes: hits and misses on empty, small (no table) and
+    /// table-backed objects, for every key representation, without interning the probe.
+    #[test]
+    fn str_lookups_hit_and_miss_without_interning() {
+        // Empty object: every `&str` path answers before touching a table.
+        let mut empty = IObject::new();
+        assert_eq!(empty.get("a"), None);
+        assert_eq!(empty.get(""), None);
+        assert_eq!(empty.get_key_value("heap_key_number_0"), None);
+        assert_eq!(empty.get_mut("a"), None);
+        assert_eq!(empty.get_mut(""), None);
+        assert_eq!(empty.remove("a"), None);
+        assert_eq!(empty.remove(""), None);
+        assert!(!empty.contains_key("a"));
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.capacity(), 0);
+
+        for n in [1usize, 2, 7, 8, 9, 16, 17, 40, 100] {
+            let keys = str_lookup_keys(n);
+            let mut obj = IObject::new();
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(obj.insert(IString::intern(k), i as i64).unwrap(), None);
+            }
+            assert_eq!(obj.len() as usize, n);
+            assert_eq!(has_table(obj.capacity()), n > 8, "n = {n}");
+            let misses = [
+                "missing",
+                "",
+                "k",
+                "s000000",
+                "e0000000",
+                "heap_key_number_",
+                "heap_key_number_999999",
+                "x0y",
+            ];
+
+            // Hits by `&str`, including an owned `String` and a `&String`.
+            for (i, k) in keys.iter().enumerate() {
+                let expected = IValue::from(i as i64);
+                assert_eq!(obj.get(k.as_str()), Some(&expected), "{n}: {k:?}");
+                assert_eq!(obj.get(&**k), Some(&expected));
+                assert!(obj.contains_key(k.as_str()));
+                let (stored, value) = obj.get_key_value(k.as_str()).unwrap();
+                assert_eq!(stored.as_str(), k);
+                assert_eq!(value, &expected);
+                // The stored key is the interned one; the probe never replaced it.
+                assert_eq!(stored, &IString::intern(k));
+            }
+            // Misses by `&str`: a key that is only present in a longer or shorter form is not
+            // found, and the object is untouched.
+            for m in misses {
+                if keys.iter().any(|k| k == m) {
+                    continue;
+                }
+                assert_eq!(obj.get(m), None, "{n}: {m:?}");
+                assert_eq!(obj.get_key_value(m), None);
+                assert!(!obj.contains_key(m));
+                assert_eq!(obj.get_mut(m), None);
+                assert_eq!(obj.remove(m), None);
+                assert_eq!(obj.remove_entry(m), None);
+            }
+            assert_eq!(obj.len() as usize, n);
+
+            // Probing by `&str` allocates nothing (no interned copy of the probe), whether the
+            // key is present or absent, short or long.
+            let allocations = mockalloc::record_allocs(|| {
+                for k in &keys {
+                    assert!(obj.get(k.as_str()).is_some());
+                }
+                for m in misses {
+                    let _ = obj.get(m);
+                    let _ = obj.contains_key(m);
+                }
+                assert!(obj.get("a key long enough to live on the heap").is_none());
+            });
+            assert_eq!(allocations.num_allocs(), 0, "n = {n}");
+
+            // `get_mut` by `&str` reaches the live value: writes are visible through every
+            // other lookup, and the key set is unchanged.
+            for (i, k) in keys.iter().enumerate() {
+                *obj.get_mut(k.as_str()).unwrap() = IValue::from(-(i as i64) - 1);
+            }
+            let allocations = mockalloc::record_allocs(|| {
+                for k in &keys {
+                    assert!(obj.get_mut(k.as_str()).is_some());
+                }
+            });
+            assert_eq!(allocations.num_allocs(), 0, "n = {n}");
+            for (i, k) in keys.iter().enumerate() {
+                let expected = IValue::from(-(i as i64) - 1);
+                assert_eq!(obj.get(k.as_str()), Some(&expected));
+                assert_eq!(obj.get(&IString::intern(k)), Some(&expected));
+                let (stored, value) = obj.get_key_value_mut(k.as_str()).unwrap();
+                assert_eq!(stored.as_str(), k);
+                assert_eq!(*value, expected);
+                assert_eq!(obj[k.as_str()], expected);
+            }
+            assert_eq!(obj.len() as usize, n);
+            let before = obj.mem_allocated();
+
+            // `remove` by `&str`: every other key stays reachable after each removal (the
+            // table is unshifted correctly), a second removal of the same key misses, and
+            // the capacity is untouched.
+            let capacity = obj.capacity();
+            // A permutation of the keys: a stride coprime to `n`, starting mid-way.
+            let stride = [7usize, 5, 3, 1]
+                .into_iter()
+                .find(|s| n % s != 0 || *s == 1)
+                .unwrap();
+            let order: Vec<usize> = (0..n).map(|i| (i * stride + 3) % n).collect();
+            let mut removed = vec![false; n];
+            for (step, &i) in order.iter().enumerate() {
+                let k = keys[i].as_str();
+                let expected = IValue::from(-(i as i64) - 1);
+                if step % 2 == 0 {
+                    assert_eq!(obj.remove(k), Some(expected), "{n}: {k:?}");
+                } else {
+                    let (stored, value) = obj.remove_entry(k).unwrap();
+                    assert_eq!(stored.as_str(), k);
+                    assert_eq!(value, expected);
+                }
+                removed[i] = true;
+                assert_eq!(obj.remove(k), None);
+                assert_eq!(obj.get(k), None);
+                assert!(!obj.contains_key(k));
+                assert_eq!(obj.len() as usize, n - step - 1);
+                for (j, other) in keys.iter().enumerate() {
+                    if !removed[j] {
+                        assert_eq!(
+                            obj.get(other.as_str()),
+                            Some(&IValue::from(-(j as i64) - 1)),
+                            "{n}: {other:?} after removing {k:?}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(obj.len(), 0);
+            assert_eq!(obj.capacity(), capacity);
+            assert!(obj.mem_allocated() <= before);
+            assert_eq!(obj.get(""), None);
+            assert_eq!(obj.get("k1"), None);
+            // Re-inserting through `IndexMut` by `&str` (the interning path) still works on the
+            // emptied table, and the `&str` probe finds it again.
+            obj["heap_key_number_3"] = IValue::TRUE;
+            obj["k1"] = IValue::FALSE;
+            obj[""] = IValue::NULL;
+            assert_eq!(obj.get("heap_key_number_3"), Some(&IValue::TRUE));
+            assert_eq!(obj.get("k1"), Some(&IValue::FALSE));
+            assert_eq!(obj.get(""), Some(&IValue::NULL));
+            assert_eq!(obj.len(), 3);
+        }
+    }
+
+    /// Compact-parsed objects (the RedisJSON `JSON.SET` path) hold exactly `len` entries; the
+    /// `&str` probe finds every key in them and misses byte-wise neighbours.
+    #[test]
+    fn str_lookups_on_parsed_objects() {
+        use crate::IValueDeserSeed;
+        use serde::de::DeserializeSeed;
+        let json = r#"{"":0,"a":1,"ab":2,"1234567":3,"12345678":4,"review_count":5,
+            "name":6,"business_id":7,"categories":8,"stars":9,"a very long key that is on the heap":10,
+            "dup":11,"dup":12,"id":13,"i":14,"city":15,"state":16,"address":17}"#;
+        for compact in [false, true] {
+            let mut de = serde_json::Deserializer::from_str(json);
+            let value = if compact {
+                IValueDeserSeed::new(None)
+                    .deserialize_compact_objects(&mut de)
+                    .unwrap()
+            } else {
+                IValueDeserSeed::new(None).deserialize(&mut de).unwrap()
+            };
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.len(), 17);
+            assert!(has_table(obj.capacity()));
+            for (k, v) in [
+                ("", 0),
+                ("a", 1),
+                ("ab", 2),
+                ("1234567", 3),
+                ("12345678", 4),
+                ("review_count", 5),
+                ("a very long key that is on the heap", 10),
+                ("dup", 12),
+                ("address", 17),
+            ] {
+                assert_eq!(obj.get(k), Some(&IValue::from(v)), "{k:?}");
+                assert_eq!(obj.get(&IString::intern(k)), Some(&IValue::from(v)));
+            }
+            for m in [
+                "A",
+                "abc",
+                "123456",
+                "123456789",
+                "review_coun",
+                "dup ",
+                "address\0",
+            ] {
+                assert_eq!(obj.get(m), None, "{m:?}");
+                assert!(!obj.contains_key(m));
+            }
+        }
+    }
 }
