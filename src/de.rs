@@ -351,7 +351,7 @@ impl<'de> Visitor<'de> for ObjectVisitor<'_> {
         V: MapAccess<'de>,
     {
         if let Some(buffer_pool) = self.buffers {
-            // Keep up to 16 unique fields inline while parsing. Final objects
+            // Keep up to 16 fields inline while parsing. Final objects
             // still use their own eight-field threshold for hash tables.
             let mut inline_entries = InlineObjectEntries::new();
             let mut indexed_entries: Option<ObjectBuffer> = None;
@@ -366,19 +366,16 @@ impl<'de> Visitor<'de> for ObjectVisitor<'_> {
                 let entries_map = match &mut indexed_entries {
                     Some(entries_map) => entries_map,
                     None => {
-                        // Duplicate keys replace their value without consuming another slot.
-                        if let Some((_, existing_value)) = inline_entries
-                            .iter_mut()
-                            .find(|(existing_key, _)| *existing_key == key)
-                        {
-                            *existing_value = value;
-                            continue;
-                        }
+                        // Inline fields are not deduplicated here: the final object's
+                        // own bucket probe (which hashes every key anyway) resolves
+                        // duplicates in `IObject::from_inline_entries`, so a duplicate
+                        // may occupy an inline slot until then.
                         if inline_entries.len() < OBJECT_BUFFER_INLINE_CAPACITY {
                             inline_entries.push((key, value));
                             continue;
                         }
-                        // The next unique field exceeds inline storage: move to a pooled map.
+                        // The next field exceeds inline storage: move to a pooled map,
+                        // which replaces duplicate values and keeps first positions.
                         let mut entries_map = buffer_pool.pop().unwrap_or_default();
                         entries_map
                             .try_reserve(inline_entries.len() + 1)
@@ -405,7 +402,7 @@ impl<'de> Visitor<'de> for ObjectVisitor<'_> {
                 }
                 return Ok(object);
             }
-            return IObject::from_unique_inline_entries(inline_entries)
+            return IObject::from_inline_entries(inline_entries)
                 .map_err(|_| SError::custom("Failed to allocate object"));
         }
 
