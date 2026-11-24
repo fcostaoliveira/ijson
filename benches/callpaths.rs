@@ -178,6 +178,86 @@ fn bench_parse(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// §1 Parse, SIMD front end (EXP-019, measurement only)
+// ---------------------------------------------------------------------------------------------
+
+/// `IValueManager::from_str` with simd-json's serde deserializer in place of serde_json's: the same
+/// `IValueDeserSeed` (compact objects, no FPHA) walks simd-json's tape. The tape build
+/// (`Deserializer::from_slice_with_buffers`: stage-1 structural scan + stage-2 tape) is part of the
+/// parse and is timed; `bufs` holds simd-json's reusable scratch buffers, set up outside the timer.
+fn parse_simd(bytes: &mut [u8], bufs: &mut simd_json::Buffers) -> IValue {
+    let mut de = simd_json::Deserializer::from_slice_with_buffers(bytes, bufs).unwrap();
+    IValueDeserSeed::new(None)
+        .deserialize_compact_objects(&mut de)
+        .unwrap()
+}
+
+/// Same, with simd-json allocating its scratch buffers inside the timer (what a one-shot
+/// `simd_json::Deserializer::from_slice` costs when nothing is cached between calls).
+fn parse_simd_fresh(bytes: &mut [u8]) -> IValue {
+    let mut de = simd_json::Deserializer::from_slice(bytes).unwrap();
+    IValueDeserSeed::new(None)
+        .deserialize_compact_objects(&mut de)
+        .unwrap()
+}
+
+fn bench_parse_simd(c: &mut Criterion) {
+    init();
+    let mut g = c.benchmark_group("parse-simd");
+    for (name, text) in fixtures() {
+        g.throughput(Throughput::Bytes(text.len() as u64));
+        // simd-json rewrites its input, so each iteration parses a fresh copy made in the setup
+        // (untimed); the produced `IValue` is dropped by criterion outside the timed section.
+        let mut bufs = simd_json::Buffers::new(text.len());
+        g.bench_with_input(BenchmarkId::new("compact-objects", name), &text, |b, t| {
+            b.iter_batched(
+                || t.clone().into_bytes(),
+                |mut bytes| parse_simd(&mut bytes, &mut bufs),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    for (name, text) in fixtures()
+        .into_iter()
+        .filter(|(n, _)| *n == "yelp" || *n == "yahoo2")
+    {
+        g.throughput(Throughput::Bytes(text.len() as u64));
+        g.bench_with_input(BenchmarkId::new("fresh-buffers", name), &text, |b, t| {
+            b.iter_batched(
+                || t.clone().into_bytes(),
+                |mut bytes| parse_simd_fresh(&mut bytes),
+                BatchSize::SmallInput,
+            )
+        });
+        // simd-json's own front end alone (stage 1 + stage 2, no ijson build): the floor a SIMD
+        // front end leaves for the `IValue` construction above it.
+        let mut bufs = simd_json::Buffers::new(text.len());
+        g.bench_with_input(BenchmarkId::new("tape-only", name), &text, |b, t| {
+            b.iter_batched(
+                || t.clone().into_bytes(),
+                |mut bytes| {
+                    let de =
+                        simd_json::Deserializer::from_slice_with_buffers(&mut bytes, &mut bufs)
+                            .unwrap();
+                    black_box(de.into_tape().0.len())
+                },
+                BatchSize::SmallInput,
+            )
+        });
+        // simd-json's own DOM for comparison (`OwnedValue`: owned strings, halfbrown maps).
+        let mut bufs = simd_json::Buffers::new(text.len());
+        g.bench_with_input(BenchmarkId::new("owned-value", name), &text, |b, t| {
+            b.iter_batched(
+                || t.clone().into_bytes(),
+                |mut bytes| simd_json::to_owned_value_with_buffers(&mut bytes, &mut bufs).unwrap(),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    g.finish();
+}
+
+// ---------------------------------------------------------------------------------------------
 // §2 Serialise
 // ---------------------------------------------------------------------------------------------
 
@@ -582,7 +662,7 @@ fn config() -> Criterion {
 criterion_group! {
     name = referee;
     config = config();
-    targets = bench_parse, bench_serialise, bench_lookup, bench_mutation, bench_typed_arrays,
+    targets = bench_parse, bench_parse_simd, bench_serialise, bench_lookup, bench_mutation, bench_typed_arrays,
               bench_clone_drop, bench_cbor, bench_memory_defrag
 }
 criterion_main!(referee);

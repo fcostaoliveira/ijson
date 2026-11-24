@@ -45,6 +45,8 @@ mockalloc = "0.1.2"
 ctor = "0.1.16"
 rand = "0.8.4"
 zstd = "0.13"
+# EXP-019 (measurement only): SIMD JSON front end for the parse benchmarks and the equivalence example.
+simd-json = "0.19"
 
 # Benchmark referee for the RedisJSON call paths (json-agent-workspace docs/USAGE-PATTERN.md).
 [[bench]]
