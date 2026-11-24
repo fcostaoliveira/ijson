@@ -701,21 +701,40 @@ impl IObject {
         }
     }
 
-    /// Moves already-deduplicated inline fields into their final storage.
-    pub(crate) fn from_unique_inline_entries(
+    /// Moves buffered inline fields into their final storage, resolving
+    /// duplicate keys on the way: the first occurrence keeps its position and
+    /// the last value wins, exactly as repeated `insert` calls would behave.
+    ///
+    /// Duplicates are detected by the same bucket probe that places each key,
+    /// so unique keys cost one hash and no key comparisons against every
+    /// earlier field. When a duplicate was found the object is shrunk so the
+    /// result is exactly sized, like every other compact-parsed object.
+    pub(crate) fn from_inline_entries(
         entries: crate::de::InlineObjectEntries,
     ) -> Result<Self, IJsonError> {
         let mut obj = Self::with_capacity(entries.len())?;
-        if !entries.is_empty() {
-            // SAFETY: the object is non-static and has space for every entry.
-            // The parser has already removed duplicate keys. Objects above
-            // the storage threshold still need their hash table initialized.
-            unsafe {
-                let mut header = obj.header_mut();
-                for (key, value) in entries {
-                    header.push_unique(key, value);
+        if entries.is_empty() {
+            return Ok(obj);
+        }
+        let mut duplicates = false;
+        // SAFETY: the object is non-static and has space for every entry,
+        // including duplicates, so each `entry` call has room for one more.
+        unsafe {
+            let mut header = obj.header_mut();
+            for (key, value) in entries {
+                match header.reborrow().entry(key) {
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(value);
+                    }
+                    Entry::Occupied(mut occupied) => {
+                        duplicates = true;
+                        occupied.insert(value);
+                    }
                 }
             }
+        }
+        if duplicates {
+            obj.shrink_to_fit();
         }
         Ok(obj)
     }
@@ -1396,6 +1415,46 @@ mod tests {
     }
 
     #[test]
+    fn inline_entries_with_duplicates_build_exact_size_last_value_wins() {
+        // Duplicates at the front, middle and end of every inline width, across
+        // both storage shapes (no table <= 8, table above). Mix inline and heap keys.
+        for len in 1..=crate::de::OBJECT_BUFFER_INLINE_CAPACITY {
+            let key = |i: usize| {
+                if i % 2 == 0 {
+                    IString::intern(&format!("k{i}"))
+                } else {
+                    IString::intern(&format!("long_field_name_{i}"))
+                }
+            };
+            let mut entries: crate::de::InlineObjectEntries = (0..len)
+                .map(|i| (key(i), IValue::from(i as i64)))
+                .collect();
+            let dups: Vec<usize> = [0, len / 2, len - 1]
+                .into_iter()
+                .filter(|&d| d < len)
+                .collect();
+            for &d in &dups {
+                if entries.len() < crate::de::OBJECT_BUFFER_INLINE_CAPACITY {
+                    entries.push((key(d), IValue::from(-(d as i64) - 1)));
+                }
+            }
+            let pushed = entries.len() - len;
+            let object = IObject::from_inline_entries(entries).unwrap();
+            assert_eq!(object.len() as usize, len);
+            assert_eq!(object.capacity() as usize, len);
+            let keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+            let expected: Vec<String> = (0..len).map(|i| key(i).to_string()).collect();
+            assert_eq!(keys, expected);
+            for &d in &dups[..pushed] {
+                assert_eq!(object[key(d).as_str()], IValue::from(-(d as i64) - 1));
+            }
+            for i in (0..len).filter(|i| !dups[..pushed].contains(i)) {
+                assert_eq!(object[key(i).as_str()], IValue::from(i as i64));
+            }
+        }
+    }
+
+    #[test]
     fn unique_inline_entries_move_and_grow() {
         // Heap keys exercise string allocation and ownership under Miri.
         for len in 0..=crate::de::OBJECT_BUFFER_INLINE_CAPACITY {
@@ -1407,7 +1466,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let mut object = IObject::from_unique_inline_entries(entries).unwrap();
+            let mut object = IObject::from_inline_entries(entries).unwrap();
             assert_eq!(object.len() as usize, len);
             assert_eq!(object.capacity() as usize, len);
             for i in len..17 {

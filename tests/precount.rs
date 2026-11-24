@@ -266,3 +266,60 @@ fn compact_objects_reuse_large_buffers_and_preserve_errors() {
     assert_eq!(value, parse(input, false).unwrap());
     assert_eq!(value.as_object().unwrap().capacity(), 3);
 }
+
+#[test]
+fn duplicate_keys_keep_first_position_and_last_value_at_every_width() {
+    // Widths cover every storage shape: no table (<= 8), table without spill
+    // (9..=16), the inline/pooled-map boundary (16, 17) and pooled-map objects.
+    // Keys mix inline (< 8 bytes) and heap-interned (>= 8 bytes) strings; the
+    // duplicates use escapes so the parser cannot match them textually.
+    for width in 1..=40usize {
+        let key = |i: usize| {
+            if i % 2 == 0 {
+                format!("k{i}")
+            } else {
+                format!("long_interned_key_{i}")
+            }
+        };
+        let escaped = |i: usize| {
+            let k = key(i);
+            format!("\\u{:04x}{}", k.as_bytes()[0], &k[1..])
+        };
+        let mut fields: Vec<String> = (0..width).map(|i| format!("\"{}\":{i}", key(i))).collect();
+        // Duplicates of the first, a middle and the last key, in the middle and at the end.
+        let dups = [0, width / 2, width - 1];
+        fields.insert(width / 2, format!("\"{}\":\"mid\"", escaped(dups[1])));
+        for d in dups {
+            fields.push(format!("\"{}\":{{\"last\":{d}}}", escaped(d)));
+        }
+        let input = format!("{{{}}}", fields.join(","));
+        let compact = parse(&input, true).unwrap();
+        let ordinary = parse(&input, false).unwrap();
+        assert_eq!(compact, ordinary, "width {width}");
+        assert_eq!(
+            serde_json::to_string(&compact).unwrap(),
+            serde_json::to_string(&ordinary).unwrap(),
+            "width {width}"
+        );
+        let object = compact.as_object().unwrap();
+        assert_eq!(object.len() as usize, width, "width {width}");
+        assert_eq!(object.capacity() as usize, width, "width {width}");
+        let keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+        let expected: Vec<String> = (0..width).map(key).collect();
+        assert_eq!(keys, expected, "width {width}");
+        for d in dups {
+            assert_eq!(object[key(d).as_str()]["last"], IValue::from(d as i64), "width {width}");
+        }
+        for i in (0..width).filter(|i| !dups.contains(i)) {
+            assert_eq!(object[key(i).as_str()], IValue::from(i as i64), "width {width}");
+        }
+    }
+    // Every field a duplicate of one key: a single exact-size entry with the last value.
+    for width in [2, 8, 9, 16, 17, 33] {
+        let fields: Vec<String> = (0..width).map(|i| format!("\"same\":{i}")).collect();
+        let value = parse(&format!("{{{}}}", fields.join(",")), true).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!((object.len(), object.capacity()), (1, 1), "width {width}");
+        assert_eq!(object["same"], IValue::from(width - 1), "width {width}");
+    }
+}
