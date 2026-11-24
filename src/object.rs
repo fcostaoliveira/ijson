@@ -5,7 +5,7 @@ use std::cmp::{self, Ordering};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
@@ -77,10 +77,22 @@ fn hash_capacity(cap: u32) -> usize {
     cap as usize + cap as usize / 4
 }
 
+/// Hasher for the per-object bucket table.
+///
+/// `hashbrown`'s default builder (`BuildHasherDefault<ahash::AHasher>`) is a zero-sized,
+/// fixed-key state: `AHasher::default()` uses `RandomState::with_fixed_keys()`, so the
+/// hash of a key is the same in every process and on every target (the AES code path is
+/// compile-time gated behind target features this crate does not enable). Nothing in
+/// `ijson` persists or compares table hashes across processes: the table stores item
+/// indices, CBOR encodes key/value pairs and rebuilds the table on decode, and defrag
+/// moves the whole block without re-hashing. The hash is non-cryptographic: it trades
+/// SipHash-1-3's HashDoS resistance for speed on the short keys JSON objects carry.
+type TableHashBuilder = hashbrown::hash_map::DefaultHashBuilder;
+
 fn hash_fn(s: &IString) -> usize {
-    let mut hasher = DefaultHasher::new();
-    s.as_str().hash(&mut hasher);
-    hasher.finish() as usize
+    // `hash_one` feeds the same bytes `str::hash` writes, so any `&str` probe of the same
+    // key lands in the same bucket as the stored `IString`.
+    TableHashBuilder::default().hash_one(s.as_str()) as usize
 }
 
 fn hash_bucket(s: &IString, hash_cap: usize) -> usize {
