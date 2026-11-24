@@ -55,3 +55,17 @@ path = "fuzz_targets/fuzz_object_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_object_entry_remove"
+path = "fuzz_targets/fuzz_object_entry_remove.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_json_de_numbers"
+path = "fuzz_targets/fuzz_json_de_numbers.rs"
+test = false
+doc = false
+bench = false
