@@ -130,18 +130,89 @@ impl std::error::Error for CborDecodeError {}
 /// Encodes an [`IValue`] tree into CBOR bytes, preserving typed array tags via
 /// RFC 8746.
 pub fn encode(value: &IValue) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_into(value, &mut out);
+    let mut out = Vec::with_capacity(size_bound::<false>(value));
+    write_plain(value, &mut out);
     out
 }
 
 /// Appends CBOR bytes to an existing buffer, preserving its prefix and typed array tags.
 pub fn encode_into(value: &IValue, out: &mut Vec<u8>) {
+    out.reserve(size_bound::<false>(value));
+    write_plain(value, out);
+}
+
+fn write_plain(value: &IValue, out: &mut Vec<u8>) {
     let cbor = EncodedValue {
         value,
         strings: Inline,
     };
     ciborium::into_writer(&cbor, out).expect("write to Vec never fails");
+}
+
+/// An upper bound on the CBOR size of `value`, so the output can be reserved once instead of
+/// growing (and copying) through every doubling. Headers of strings, arrays, maps and typed
+/// arrays are counted exactly, numbers at their nine-byte maximum. With `STREAM`, each string
+/// long enough for the stream encoder to define gets the one-byte definition tag; a reference
+/// (tag plus an id below `u32::MAX`, at most six bytes) is shorter than the text it replaces.
+pub(crate) fn size_bound<const STREAM: bool>(value: &IValue) -> usize {
+    match value.destructure_ref() {
+        DestructuredRef::Null | DestructuredRef::Bool(_) => 1,
+        DestructuredRef::Number(_) => 9,
+        DestructuredRef::String(string) => text_bound::<STREAM>(string),
+        DestructuredRef::Object(object) => {
+            let mut total = header_len(object.len() as usize);
+            for (key, value) in object.iter() {
+                total += text_bound::<STREAM>(key) + size_bound::<STREAM>(value);
+            }
+            total
+        }
+        DestructuredRef::Array(array) => match array.as_slice() {
+            ArraySliceRef::Heterogeneous(values) => {
+                let mut total = header_len(values.len());
+                for value in values {
+                    total += size_bound::<STREAM>(value);
+                }
+                total
+            }
+            ArraySliceRef::I8(values) => typed_bound(TAG_I8, values),
+            ArraySliceRef::U8(values) => typed_bound(TAG_U8, values),
+            ArraySliceRef::I16(values) => typed_bound(TAG_I16_LE, values),
+            ArraySliceRef::U16(values) => typed_bound(TAG_U16_LE, values),
+            ArraySliceRef::F16(values) => typed_bound(TAG_F16_LE, values),
+            ArraySliceRef::BF16(values) => typed_bound(TAG_BF16_LE, values),
+            ArraySliceRef::I32(values) => typed_bound(TAG_I32_LE, values),
+            ArraySliceRef::U32(values) => typed_bound(TAG_U32_LE, values),
+            ArraySliceRef::F32(values) => typed_bound(TAG_F32_LE, values),
+            ArraySliceRef::I64(values) => typed_bound(TAG_I64_LE, values),
+            ArraySliceRef::U64(values) => typed_bound(TAG_U64_LE, values),
+            ArraySliceRef::F64(values) => typed_bound(TAG_F64_LE, values),
+        },
+    }
+}
+
+/// Bytes of a CBOR header whose argument is `n`: the initial byte plus 0, 1, 2, 4 or 8.
+#[inline]
+fn header_len(n: usize) -> usize {
+    1 + match n {
+        0..=23 => 0,
+        24..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    }
+}
+
+#[inline]
+fn text_bound<const STREAM: bool>(string: &IString) -> usize {
+    let len = string.len();
+    header_len(len) + len + (STREAM && len >= stream::MIN_DEFINED_LEN) as usize
+}
+
+/// A typed array is a tag header followed by a byte string: exact.
+#[inline]
+fn typed_bound<T>(tag: u64, values: &[T]) -> usize {
+    let bytes = std::mem::size_of_val(values);
+    header_len(tag as usize) + header_len(bytes) + bytes
 }
 
 /// Encodes an [`IValue`] tree as CBOR and then compresses it with zstd (level 3).
@@ -869,6 +940,150 @@ mod tests {
         let mut out = vec![0, 42];
         super::encode_into(&value, &mut out);
         assert_eq!(out, [0, 42, 0x65, b'h', b'e', b'l', b'l', b'o']);
+    }
+
+    /// Every shape the size bound counts: nested objects, arrays of 24+ elements (1-byte length
+    /// headers), strings whose lengths take 0-, 1- and 2-byte headers, a long string that repeats
+    /// (what the stream encoder defines and references), typed arrays of every width, and, when
+    /// asked, numbers of every header size.
+    fn bound_fixture(with_numbers: bool) -> IValue {
+        let mut text = String::from(r#"{"meta":{"name":"shared string value","tags":["#);
+        for i in 0..30 {
+            text += &format!("\"tag number {i}\",");
+        }
+        text += "\"shared string value\"],\"long\":\"";
+        text += &"x".repeat(300);
+        text += "\",\"flags\":[true,false,null,\"\",\"short\"]";
+        if with_numbers {
+            text +=
+                ",\"nums\":[0,23,24,255,256,65535,65536,4294967296,-1,-25,-9223372036854775808,";
+            text += "18446744073709551615,1.5,-0.0,1e300,5e-324]";
+        }
+        text += "},\"rows\":[";
+        for i in 0..40 {
+            text += &format!(
+                "{{\"label\":\"shared string value\",\"note\":\"row note {i:04}\",\"k\":{{}},\"e\":[]}},"
+            );
+        }
+        text.pop();
+        text += "]}";
+        let mut value: IValue = serde_json::from_str(&text).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object
+            .insert("i8", IArray::try_from(vec![i8::MIN; 3]).unwrap())
+            .unwrap();
+        object
+            .insert("u8", IArray::try_from(vec![u8::MAX; 24]).unwrap())
+            .unwrap();
+        object
+            .insert("i16", IArray::try_from(vec![i16::MIN; 5]).unwrap())
+            .unwrap();
+        object
+            .insert("u16", IArray::try_from(vec![u16::MAX; 200]).unwrap())
+            .unwrap();
+        object
+            .insert(
+                "f16",
+                IArray::try_from(vec![f16::from_f32(1.5); 7]).unwrap(),
+            )
+            .unwrap();
+        object
+            .insert(
+                "bf16",
+                IArray::try_from(vec![bf16::from_f32(1.5); 7]).unwrap(),
+            )
+            .unwrap();
+        object
+            .insert("i32", IArray::try_from(vec![i32::MIN; 9]).unwrap())
+            .unwrap();
+        object
+            .insert("u32", IArray::try_from(vec![u32::MAX; 9]).unwrap())
+            .unwrap();
+        object
+            .insert("f32", IArray::try_from(vec![1.5f32; 11]).unwrap())
+            .unwrap();
+        object
+            .insert("i64", IArray::try_from(vec![i64::MIN; 13]).unwrap())
+            .unwrap();
+        object
+            .insert("u64", IArray::try_from(vec![u64::MAX; 13]).unwrap())
+            .unwrap();
+        object
+            .insert("f64", IArray::try_from(vec![1.5f64; 1000]).unwrap())
+            .unwrap();
+        value
+    }
+
+    #[test]
+    fn presized_encoding_matches_unreserved_bytes() {
+        for value in [bound_fixture(true), bound_fixture(false)] {
+            // The writer alone, into a buffer that grows from nothing, as `encode` did before
+            // it reserved the size bound.
+            let mut expected = Vec::new();
+            let cbor = EncodedValue {
+                value: &value,
+                strings: Inline,
+            };
+            ciborium::into_writer(&cbor, &mut expected).unwrap();
+            let actual = encode(&value);
+            assert_eq!(actual, expected);
+            assert!(actual.len() <= size_bound::<false>(&value));
+            assert_eq!(decode(&actual).unwrap(), value);
+
+            let mut appended = vec![7, 7, 7];
+            encode_into(&value, &mut appended);
+            assert_eq!(&appended[..3], [7, 7, 7]);
+            assert_eq!(&appended[3..], expected);
+        }
+    }
+
+    #[test]
+    fn size_bound_is_exact_without_numbers() {
+        let value = bound_fixture(false);
+        assert_eq!(encode(&value).len(), size_bound::<false>(&value));
+        for value in [
+            IValue::NULL,
+            IValue::from(true),
+            IValue::from(""),
+            IValue::from("x".repeat(23).as_str()),
+            IValue::from("x".repeat(24).as_str()),
+            IValue::from("x".repeat(255).as_str()),
+            IValue::from("x".repeat(256).as_str()),
+            IValue::from("x".repeat(65_535).as_str()),
+            IValue::from("x".repeat(65_536).as_str()),
+            IArray::try_from(vec![0u8; 65_536]).unwrap().into(),
+        ] {
+            assert_eq!(encode(&value).len(), size_bound::<false>(&value));
+        }
+        // Numbers are counted at their maximum.
+        for value in [IValue::from(0), IValue::from(1.5), IValue::from(u64::MAX)] {
+            assert!(encode(&value).len() <= size_bound::<false>(&value));
+            assert_eq!(size_bound::<false>(&value), 9);
+        }
+    }
+
+    #[test]
+    fn stream_encoding_fits_size_bound() {
+        let value = bound_fixture(true);
+        let config = StreamEncoderConfig {
+            table_budget_bytes: usize::MAX,
+        };
+        let mut encoder = StreamEncoder::new(config);
+        let mut decoder = StreamDecoder::new();
+        // First document: definitions and references; second: references only.
+        for round in 0..2 {
+            let mut out = vec![0; 5];
+            let used = encoder.encode_into(&mut out, &value);
+            assert!(used.defs > 0 || round > 0);
+            assert!(used.refs > 0);
+            assert!(out.len() - 5 <= size_bound::<true>(&value));
+            assert_eq!(decoder.decode(&out[5..], true).unwrap(), value);
+        }
+        // The plain bound is what a document with no string to define costs.
+        let plain = IValue::from("x".repeat(7).as_str());
+        let mut out = Vec::new();
+        encoder.encode_into(&mut out, &plain);
+        assert_eq!(out.len(), size_bound::<false>(&plain));
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub(super) type DecoderCell<'a> = RefCell<&'a mut StreamDecoder>;
 /// Shortest string, in UTF-8 bytes, that is defined and referenced. Strings of up to 7 bytes are
 /// stored inside their handles and have no address to recognize them by, so every string that
 /// has an address qualifies.
-const MIN_DEFINED_LEN: usize = 8;
+pub(super) const MIN_DEFINED_LEN: usize = 8;
 
 /// Settings for a [`StreamEncoder`].
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +210,7 @@ impl<D: StringDictionary> StreamEncoder<D> {
     /// document are written inline.
     pub fn encode_into(&mut self, out: &mut Vec<u8>, value: &IValue) -> DocUse {
         let (defs, refs) = (self.stats.defs, self.stats.refs);
+        out.reserve(super::size_bound::<true>(value));
         let encoder = RefCell::new(&mut *self);
         let cbor = EncodedValue {
             value,
