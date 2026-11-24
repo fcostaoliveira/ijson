@@ -83,8 +83,32 @@ fn hash_fn(s: &IString) -> usize {
     hasher.finish() as usize
 }
 
+/// Home bucket of a key: one division per lookup. The mapping is unchanged from the original
+/// `hash % hash_cap`, so every table keeps the same layout and probe lengths.
 fn hash_bucket(s: &IString, hash_cap: usize) -> usize {
     hash_fn(s) % hash_cap
+}
+
+/// The bucket after `bucket` with wrap-around, without a division.
+#[inline(always)]
+fn next_bucket(bucket: usize, hash_cap: usize) -> usize {
+    let next = bucket + 1;
+    if next == hash_cap {
+        0
+    } else {
+        next
+    }
+}
+
+/// Probe distance of a resident found at `bucket` whose home bucket is `home`
+/// (both below `hash_cap`), without a division.
+#[inline(always)]
+fn probe_distance(bucket: usize, home: usize, hash_cap: usize) -> usize {
+    if bucket >= home {
+        bucket - home
+    } else {
+        bucket + hash_cap - home
+    }
 }
 
 struct SplitHeader<'a> {
@@ -115,11 +139,10 @@ impl<'a> SplitHeader<'a> {
                 .ok_or(u32::MAX);
         }
         let hash_cap = hash_capacity(self.cap);
-        let initial_bucket = hash_bucket(key, hash_cap);
+        let mut bucket = hash_bucket(key, hash_cap);
         unsafe {
             // Linear search from expected bucket
             for i in 0..hash_cap {
-                let bucket = (initial_bucket + i) % hash_cap;
                 let index = *self.table.get_unchecked(bucket);
 
                 // If we hit an empty bucket, we know the key is not present
@@ -135,10 +158,11 @@ impl<'a> SplitHeader<'a> {
 
                 // If the bucket contains a different key, and its probe length is less than
                 // ours, then we know our key is not present or we would have evicted this one.
-                let key_dist = (bucket + hash_cap - hash_bucket(k, hash_cap)) % hash_cap;
+                let key_dist = probe_distance(bucket, hash_bucket(k, hash_cap), hash_cap);
                 if key_dist < i {
                     return Err(bucket as u32);
                 }
+                bucket = next_bucket(bucket, hash_cap);
             }
         }
         Err(u32::MAX)
@@ -156,7 +180,7 @@ impl<'a> SplitHeader<'a> {
         // We don't bother with any early exit conditions, because
         // we know the item is present.
         while *self.table.get_unchecked(bucket) != index as u32 {
-            bucket = (bucket + 1) % hash_cap;
+            bucket = next_bucket(bucket, hash_cap);
         }
 
         bucket as u32
@@ -182,10 +206,10 @@ impl<'a> SplitHeaderMut<'a> {
     // Shifts elements up to fill the empty space if they are not at their ideal location.
     unsafe fn unshift(&mut self, initial_bucket: u32) {
         let hash_cap = hash_capacity(self.cap);
-        let initial_bucket = initial_bucket as usize;
-        let mut prev_bucket = initial_bucket;
-        for i in 1..hash_cap {
-            let bucket = (initial_bucket + i) % hash_cap;
+        let mut bucket = initial_bucket as usize;
+        let mut prev_bucket = bucket;
+        for _ in 1..hash_cap {
+            bucket = next_bucket(bucket, hash_cap);
             let index = *self.table.get_unchecked(bucket);
 
             // If we hit an empty bucket, we're done
@@ -215,15 +239,15 @@ impl<'a> SplitHeaderMut<'a> {
             return;
         }
         let hash_cap = hash_capacity(self.cap);
-        let initial_bucket = initial_bucket as usize;
-        for i in 0..hash_cap {
+        let mut bucket = initial_bucket as usize;
+        for _ in 0..hash_cap {
             // If we hit an empty bucket, we're done
             if index == u32::MAX {
                 return;
             }
 
-            let bucket = (initial_bucket + i) % hash_cap;
             mem::swap(self.table.get_unchecked_mut(bucket), &mut index);
+            bucket = next_bucket(bucket, hash_cap);
         }
     }
     // Safety: Bucket index must be in range and occupied. In no-table mode, `bucket`
