@@ -1555,6 +1555,63 @@ mod tests {
     }
 
     #[test]
+    fn saturated_probe_distances_stay_correct() {
+        // 300 keys that all share home bucket 0 of a 300-capacity table (375 buckets) form one
+        // cluster whose probe distances exceed the cached byte (255). Lookups, inserts and the
+        // unshift after a removal must then recompute the distance from the key.
+        let hash_cap = hash_capacity(300);
+        let mut keys = Vec::new();
+        let mut i = 0u64;
+        while keys.len() < 300 {
+            let candidate = format!("cluster_key_{i}");
+            let mut hasher = DefaultHasher::new();
+            candidate.as_str().hash(&mut hasher);
+            if hasher.finish() as usize % hash_cap == 0 {
+                let key = IString::intern(&candidate);
+                assert_eq!(hash_bucket(&key, hash_cap), 0);
+                keys.push(key);
+            }
+            i += 1;
+        }
+        let mut obj = IObject::with_capacity(300).unwrap();
+        for (n, k) in keys.iter().enumerate() {
+            obj.insert(k.clone(), IValue::from(n as i64)).unwrap();
+        }
+        assert_eq!(obj.capacity(), 300);
+        assert_eq!(obj.len(), 300);
+        for (n, k) in keys.iter().enumerate() {
+            assert_eq!(obj.get(k).and_then(IValue::to_i64), Some(n as i64));
+        }
+        assert!(obj.get("cluster_key_missing").is_none());
+        // Removing the front of the cluster shifts every later slot back by one, through the
+        // saturated region.
+        for k in keys.iter().take(10) {
+            assert!(obj.remove(k).is_some());
+        }
+        for k in keys.iter().take(10) {
+            assert!(obj.get(k).is_none());
+        }
+        for (n, k) in keys.iter().enumerate().skip(10) {
+            assert_eq!(obj.get(k).and_then(IValue::to_i64), Some(n as i64));
+        }
+        // Re-inserting them appends to the cluster again.
+        for (n, k) in keys.iter().enumerate().take(10) {
+            obj.insert(k.clone(), IValue::from(n as i64)).unwrap();
+        }
+        assert_eq!(obj.len(), 300);
+        for (n, k) in keys.iter().enumerate() {
+            assert_eq!(obj.get(k).and_then(IValue::to_i64), Some(n as i64));
+        }
+        // Removing from the back of the cluster must not disturb the saturated slots.
+        for k in keys.iter().rev().take(50) {
+            assert!(obj.remove(k).is_some());
+        }
+        for (n, k) in keys.iter().enumerate().take(250) {
+            assert_eq!(obj.get(k).and_then(IValue::to_i64), Some(n as i64));
+        }
+    }
+
+    #[test]
     fn large_object_has_table() {
         assert!(has_table(16));
         // 8-byte header + 16 x 16-byte items + 20 x 5-byte buckets = 364, padded to 8 -> 368.
