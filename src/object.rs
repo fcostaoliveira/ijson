@@ -1634,6 +1634,81 @@ mod tests {
         assert_eq!(obj.len(), 250);
     }
 
+    /// The probe loop over a table with no empty bucket. A live object always has one
+    /// (`hash_capacity(cap) > cap >= len`), so this is the loop's own termination contract,
+    /// checked on a synthetic table: when every bucket holds a resident that probed further than
+    /// the key (so no early "not present" exit applies) and none is at the key's distance (so no
+    /// key is compared), the probe visits every bucket once and reports no vacancy, with and
+    /// without duplicate checking. With one empty bucket, it reports that bucket and the number
+    /// of steps to it.
+    #[test]
+    fn probe_over_a_full_table_reports_no_vacancy() {
+        let cap = 16u32;
+        let hash_cap = hash_capacity(cap);
+        assert_eq!(hash_cap, 20);
+        let key = IString::intern("probe_key_of_a_full_table");
+        let home = hash_bucket(&key, hash_cap);
+        // Residents are never dereferenced (their cached distance is below saturation and
+        // never equals the probe step), so no items are needed.
+        let items: &[KeyValuePair] = &[];
+        let far = Bucket::new(0, hash_cap + 1);
+        let far_distance = far.distance; // copied out: the struct is packed
+        assert_eq!(far_distance, (hash_cap + 1) as u8);
+        let full = vec![far; hash_cap];
+        let header = SplitHeader {
+            cap,
+            items,
+            table: &full,
+        };
+        let vacancy = header.find_bucket(&key).unwrap_err();
+        assert_eq!(vacancy.bucket, u32::MAX);
+        assert_eq!(vacancy.distance, 0);
+        let vacancy = header.find_bucket_impl::<false>(&key).unwrap_err();
+        assert_eq!(vacancy.bucket, u32::MAX);
+        assert_eq!(vacancy.distance, 0);
+
+        // One empty bucket, placed so the probe wraps around the end of the table to reach it.
+        for steps in [0usize, 1, hash_cap - 1] {
+            let empty_at = (home + steps) % hash_cap;
+            let mut table = full.clone();
+            table[empty_at] = Bucket::EMPTY;
+            let header = SplitHeader {
+                cap,
+                items,
+                table: &table,
+            };
+            let vacancy = header.find_bucket(&key).unwrap_err();
+            assert_eq!(vacancy.bucket as usize, empty_at, "steps = {steps}");
+            assert_eq!(vacancy.distance as usize, steps);
+            assert_eq!(
+                probe_distance(empty_at, home, hash_cap),
+                steps,
+                "steps = {steps}"
+            );
+        }
+        // A resident that probed less far than the key stops the probe at its bucket.
+        let mut table = full.clone();
+        let near_at = (home + 2) % hash_cap;
+        table[near_at] = Bucket::new(0, 1);
+        let header = SplitHeader {
+            cap,
+            items,
+            table: &table,
+        };
+        let vacancy = header.find_bucket(&key).unwrap_err();
+        assert_eq!(vacancy.bucket as usize, near_at);
+        assert_eq!(vacancy.distance, 2);
+        // The helpers the loop steps with.
+        assert_eq!(next_bucket(hash_cap - 1, hash_cap), 0);
+        assert_eq!(next_bucket(3, hash_cap), 4);
+        assert_eq!(probe_distance(3, 3, hash_cap), 0);
+        assert_eq!(probe_distance(1, hash_cap - 1, hash_cap), 2);
+        let saturated = Bucket::new(7, 1000);
+        let (index, distance) = (saturated.index, saturated.distance);
+        assert_eq!(distance, DISTANCE_SATURATED);
+        assert_eq!(index, 7);
+    }
+
     #[test]
     fn saturated_probe_distances_stay_correct() {
         saturated_cluster_scenario(0);
