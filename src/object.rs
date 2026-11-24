@@ -365,6 +365,8 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
     }
 
     // Safety: Must ensure there's capacity for an extra element
+    unsafe fn entry(self, key: IString) -> Entry<'a>;
+    // Safety: Must ensure there's capacity for an extra element
     unsafe fn entry_or_clone(self, key: &IString) -> Entry<'a>;
 
     // Safety: Object must not be empty
@@ -409,6 +411,20 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
 
 impl<'a, T: ThinRefExt<'a, Header>> HeaderRef<'a> for T {}
 impl<'a> HeaderMut<'a> for ThinMut<'a, Header> {
+    // Safety: Must ensure there's capacity for an extra element
+    unsafe fn entry(self, key: IString) -> Entry<'a> {
+        match self.split().find_bucket(&key) {
+            Err(bucket) => Entry::Vacant(VacantEntry {
+                header: self,
+                bucket,
+                key,
+            }),
+            Ok(bucket) => Entry::Occupied(OccupiedEntry {
+                header: self,
+                bucket,
+            }),
+        }
+    }
     // Safety: Must ensure there's capacity for an extra element
     unsafe fn entry_or_clone(self, key: &IString) -> Entry<'a> {
         match self.split().find_bucket(key) {
