@@ -320,14 +320,29 @@ impl<'de> Visitor<'de> for ArrayVisitor<'_> {
     {
         let mut arr = IArray::with_capacity(visitor.size_hint().unwrap_or(0))
             .map_err(|_| SError::custom("Failed to allocate array"))?;
-        while visitor
-            .next_element_seed(ArrayElemSeed {
-                arr: &mut arr,
-                fpha_config: self.fpha_config,
-                buffers: self.buffers.as_deref_mut(),
-            })?
-            .is_some()
-        {}
+        // Two monomorphised seeds: the FPHA decision is made once per array, not once per element.
+        match self.fpha_config {
+            Some(FPHAConfig { fpha_type }) => {
+                while visitor
+                    .next_element_seed(ArrayElemSeed::<true> {
+                        arr: &mut arr,
+                        fpha_type,
+                        buffers: self.buffers.as_deref_mut(),
+                    })?
+                    .is_some()
+                {}
+            }
+            None => {
+                while visitor
+                    .next_element_seed(ArrayElemSeed::<false> {
+                        arr: &mut arr,
+                        fpha_type: FloatType::F64,
+                        buffers: self.buffers.as_deref_mut(),
+                    })?
+                    .is_some()
+                {}
+            }
+        }
         Ok(arr)
     }
 }
@@ -336,32 +351,37 @@ impl<'de> Visitor<'de> for ArrayVisitor<'_> {
 /// array's current `F64` storage is written without first being boxed into an `IValue`
 /// (`IArray::push_f64_direct`). Every other element is built by `ValueVisitor` and appended with
 /// the same `push` / `push_with_fp_type` calls as before, so tag selection is unchanged.
-struct ArrayElemSeed<'a> {
+/// `FPHA` is the array's float-type-forcing mode, fixed per array so no element pays for the check.
+struct ArrayElemSeed<'a, const FPHA: bool> {
     arr: &'a mut IArray,
-    fpha_config: Option<FPHAConfig>,
+    fpha_type: FloatType,
     buffers: Option<&'a mut Vec<ObjectBuffer>>,
 }
 
-impl<'a> ArrayElemSeed<'a> {
+impl<'a, const FPHA: bool> ArrayElemSeed<'a, FPHA> {
+    #[inline(always)]
     fn value_visitor(&mut self) -> ValueVisitor<'_> {
         ValueVisitor {
-            fpha_config: self.fpha_config,
+            fpha_config: if FPHA { Some(FPHAConfig { fpha_type: self.fpha_type }) } else { None },
             buffers: self.buffers.as_deref_mut(),
         }
     }
 
+    #[inline(always)]
     fn push<E: SError>(self, v: IValue) -> Result<(), E> {
-        match self.fpha_config {
-            Some(FPHAConfig { fpha_type }) => self.arr.push_with_fp_type(v, fpha_type),
-            None => self.arr.push(v),
+        if FPHA {
+            self.arr.push_with_fp_type(v, self.fpha_type)
+        } else {
+            self.arr.push(v)
         }
         .map_err(|e| SError::custom(e.to_string()))
     }
 }
 
-impl<'de> DeserializeSeed<'de> for ArrayElemSeed<'_> {
+impl<'de, const FPHA: bool> DeserializeSeed<'de> for ArrayElemSeed<'_, FPHA> {
     type Value = ();
 
+    #[inline(always)]
     fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
     where
         D: Deserializer<'de>,
@@ -370,31 +390,31 @@ impl<'de> DeserializeSeed<'de> for ArrayElemSeed<'_> {
     }
 }
 
-impl<'de> Visitor<'de> for ArrayElemSeed<'_> {
+impl<'de, const FPHA: bool> Visitor<'de> for ArrayElemSeed<'_, FPHA> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
         formatter.write_str("any valid JSON value")
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_bool<E: SError>(self, value: bool) -> Result<(), E> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_i64<E: SError>(self, value: i64) -> Result<(), E> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_u64<E: SError>(self, value: u64) -> Result<(), E> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_f64<E: SError>(self, value: f64) -> Result<(), E> {
-        if self.fpha_config.is_none()
+        if !FPHA
             && self
                 .arr
                 .push_f64_direct(value)
@@ -405,22 +425,22 @@ impl<'de> Visitor<'de> for ArrayElemSeed<'_> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_str<E: SError>(self, value: &str) -> Result<(), E> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_string<E: SError>(self, value: String) -> Result<(), E> {
         self.push(value.into())
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_none<E: SError>(self) -> Result<(), E> {
         self.push(IValue::NULL)
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_some<D>(mut self, deserializer: D) -> Result<(), D::Error>
     where
         D: Deserializer<'de>,
@@ -429,7 +449,7 @@ impl<'de> Visitor<'de> for ArrayElemSeed<'_> {
         self.push(v)
     }
 
-    #[inline]
+    #[inline(always)]
     fn visit_unit<E: SError>(self) -> Result<(), E> {
         self.push(IValue::NULL)
     }
