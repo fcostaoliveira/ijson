@@ -1132,6 +1132,7 @@ impl IArray {
 
     /// Pushes a new item onto the back of the array with a specific floating-point type, potentially losing precision.
     /// If the item is not a number, it is pushed as is.
+    #[inline]
     pub(crate) fn push_with_fp_type(
         &mut self,
         item: impl Into<IValue>,
@@ -1178,6 +1179,7 @@ impl IArray {
     /// tag-selection and promotion rules. In the fast-path state the two are equivalent:
     /// `prepare_for_item` would find `can_push_directly(F64)` true and `push` would unbox the same
     /// `f64` into the same slot.
+    #[inline]
     pub(crate) fn push_f64_direct(&mut self, value: f64) -> Result<bool, IJsonError> {
         if self.is_static()
             || self.len() == 0
@@ -1199,6 +1201,7 @@ impl IArray {
     }
 
     /// Pushes a new item onto the back of the array.
+    #[inline]
     pub fn push(&mut self, item: impl Into<IValue>) -> Result<(), IJsonError> {
         let item = item.into();
         self.prepare_for_item(&item)?;
