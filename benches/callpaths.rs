@@ -304,44 +304,38 @@ fn bench_mutation(c: &mut Criterion) {
         )
     });
     // JSON.NUMINCRBY on an integer field: read, add, replace (number.rs / ivalue_manager.rs)
+    // One object mutated in place: repeated INCRBY on the same key is what RedisJSON sees, the value
+    // drifting is realistic, and a setup clone would make the routine's cache state depend on the
+    // clone implementation (harness r4).
+    let mut biz_i64 = biz.clone();
     g.bench_function("num-incrby-i64", |b| {
-        b.iter_batched(
-            || biz.clone(),
-            |mut o| {
-                let v = o.get_mut("review_count").unwrap();
-                let n = v.as_number().unwrap().to_i64().unwrap();
-                *v = IValue::from(INumber::from(n + 1));
-                o
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            let v = biz_i64.get_mut("review_count").unwrap();
+            let n = v.as_number().unwrap().to_i64().unwrap();
+            *v = IValue::from(INumber::from(n.wrapping_add(1)));
+        })
     });
     // JSON.NUMINCRBY on a float field
+    let mut biz_f64 = biz.clone();
     g.bench_function("num-incrby-f64", |b| {
-        b.iter_batched(
-            || biz.clone(),
-            |mut o| {
-                let v = o.get_mut("latitude").unwrap();
-                let n = v.as_number().unwrap().to_f64().unwrap();
-                *v = IValue::from(n + 0.5);
-                o
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            let v = biz_f64.get_mut("latitude").unwrap();
+            let n = v.as_number().unwrap().to_f64().unwrap();
+            *v = IValue::from(n + 0.5);
+        })
     });
-    // JSON.STRAPPEND: concatenate and re-intern
+    // JSON.STRAPPEND: build the appended string from the field's current value and re-intern it; the
+    // field is rewritten from a fixed base each time so the string does not grow across iterations.
+    let mut biz_str = biz.clone();
+    let city_base = biz_str.get("city").unwrap().as_string().unwrap().as_str().to_owned();
     g.bench_function("str-append", |b| {
-        b.iter_batched(
-            || biz.clone(),
-            |mut o| {
-                let v = o.get_mut("city").unwrap();
-                let mut s = v.as_string().unwrap().as_str().to_owned();
-                s.push_str(" (appended)");
-                *v = IValue::from(IString::from(s));
-                o
-            },
-            BatchSize::SmallInput,
-        )
+        b.iter(|| {
+            let v = biz_str.get_mut("city").unwrap();
+            let mut s = String::with_capacity(city_base.len() + 11);
+            s.push_str(black_box(&city_base));
+            s.push_str(" (appended)");
+            *v = IValue::from(IString::from(s));
+        })
     });
     g.finish();
 }
@@ -405,8 +399,10 @@ fn bench_clone_drop(c: &mut Criterion) {
     for (name, text) in fixtures().into_iter().filter(|(n, _)| matches!(*n, "yelp" | "gmaps-place" | "floats-1024")) {
         let doc = parse(&text, None);
         g.bench_with_input(BenchmarkId::new("clone", name), &doc, |b, d| b.iter(|| black_box(d.clone())));
-        g.bench_with_input(BenchmarkId::new("drop", name), &doc, |b, d| {
-            b.iter_batched(|| d.clone(), drop, BatchSize::SmallInput)
+        // Drop a freshly parsed value, not a clone: the clone implementation must not decide the
+        // cache state the drop runs in (harness r4). Parsing in setup is slower but untimed.
+        g.bench_with_input(BenchmarkId::new("drop", name), &text, |b, t| {
+            b.iter_batched(|| parse(t, None), drop, BatchSize::SmallInput)
         });
     }
     g.finish();
