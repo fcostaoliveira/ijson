@@ -40,6 +40,8 @@ pub mod convert;
 pub mod error;
 mod thin;
 mod value;
+#[cfg(test)]
+mod adversarial_tests;
 
 pub use array::{FloatType, IArray};
 pub use convert::{TryCollect, TryExtend, TryFromIterator};
