@@ -1554,18 +1554,16 @@ mod tests {
         assert_eq!(IObject::layout(4).unwrap().size(), 72);
     }
 
-    #[test]
-    fn saturated_probe_distances_stay_correct() {
-        // 300 keys that all share the last home bucket of a 300-capacity table (375 buckets)
-        // form one cluster that wraps around the table end and whose probe distances exceed
-        // the cached byte (255). Lookups, inserts and the unshift after a removal must then
+    fn saturated_cluster_scenario(home: usize) {
+        // 300 keys that all share one home bucket of a 300-capacity table (375 buckets) form
+        // one cluster (wrapping around the table end when `home` is the last bucket) whose
+        // probe distances exceed the cached byte (255). Lookups, inserts and the unshift after a removal must then
         // recompute the distance from the key.
         let hash_cap = hash_capacity(300);
-        let home = hash_cap - 1;
         let mut keys = Vec::new();
         let mut i = 0u64;
         while keys.len() < 300 {
-            let candidate = format!("cluster_key_{i}");
+            let candidate = format!("cluster_key_{home}_{i}");
             let mut hasher = DefaultHasher::new();
             candidate.as_str().hash(&mut hasher);
             if hasher.finish() as usize % hash_cap == home {
@@ -1596,11 +1594,8 @@ mod tests {
             Entry::Vacant(_) => panic!("key 299 is present"),
         }
         *obj.get_mut(&keys[299]).unwrap() = IValue::from(299i64);
-        assert!(matches!(
-            obj.entry_or_clone(&IString::intern("cluster_key_absent"))
-                .unwrap(),
-            Entry::Vacant(_)
-        ));
+        // The object is full: nothing above may have grown (and so re-laid out) the table.
+        assert_eq!(obj.capacity(), 300);
         assert_eq!(obj.len(), 300);
         // Removing the front of the cluster shifts every later slot back by one, through the
         // saturated region.
@@ -1628,6 +1623,21 @@ mod tests {
         for (n, k) in keys.iter().enumerate().take(250) {
             assert_eq!(obj.get(k).and_then(IValue::to_i64), Some(n as i64));
         }
+        // A vacant entry through the clone-on-insert API probes the same cluster (the object
+        // has spare capacity here, so no resize happens).
+        assert!(matches!(
+            obj.entry_or_clone(&IString::intern("cluster_key_absent"))
+                .unwrap(),
+            Entry::Vacant(_)
+        ));
+        assert_eq!(obj.capacity(), 300);
+        assert_eq!(obj.len(), 250);
+    }
+
+    #[test]
+    fn saturated_probe_distances_stay_correct() {
+        saturated_cluster_scenario(0);
+        saturated_cluster_scenario(hash_capacity(300) - 1);
     }
 
     #[test]
