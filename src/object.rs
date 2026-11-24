@@ -1575,4 +1575,193 @@ mod tests {
             assert_eq!(x, IObject::new());
         }
     }
+
+    /// Checks a clone against its source and then that the clone's table is a working table of
+    /// its own: every key is found by `IString` and by `&str`, values can be changed and keys
+    /// removed and re-added in the clone without the source noticing.
+    fn check_clone(source: &IObject, clone: &mut IObject) {
+        assert_eq!(*clone, *source);
+        assert_eq!(clone.len(), source.len());
+        assert_eq!(clone.capacity(), source.capacity());
+        assert_eq!(clone.mem_allocated(), source.mem_allocated());
+        let keys: Vec<IString> = source.keys().cloned().collect();
+        let clone_keys: Vec<IString> = clone.keys().cloned().collect();
+        assert_eq!(keys, clone_keys, "items are cloned index for index");
+        for (k, v) in source.iter() {
+            assert_eq!(clone.get(k), Some(v));
+            assert_eq!(clone.get(k.as_str()), Some(v));
+            assert_eq!(clone.get_key_value(k).map(|(k, _)| k), Some(k));
+        }
+        assert_eq!(clone.get("a key that is in no object"), None);
+        assert_eq!(clone.get(&IString::intern("another absent key")), None);
+        // Writes through the clone's table stay in the clone.
+        for k in &keys {
+            *clone.get_mut(k).unwrap() = IValue::from("changed");
+        }
+        for (k, v) in source.iter() {
+            assert_ne!(v, &IValue::from("changed"));
+            assert_eq!(clone.get(k.as_str()), Some(&IValue::from("changed")));
+        }
+        // Removing from the clone unshifts the clone's table; the source keeps every key.
+        let n = keys.len();
+        for (step, k) in keys.iter().enumerate() {
+            assert_eq!(clone.remove(k), Some(IValue::from("changed")), "{k:?}");
+            assert_eq!(clone.remove(k), None);
+            assert_eq!(clone.len(), (n - step - 1) as u32);
+            for other in &keys[step + 1..] {
+                assert!(clone.contains_key(other), "{other:?} after removing {k:?}");
+            }
+            assert!(source.contains_key(k));
+        }
+        assert_eq!(source.len(), n as u32);
+        // Inserting into the emptied clone, past its capacity, rebuilds its table normally.
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(clone.insert(k.clone(), i as i64).unwrap(), None);
+        }
+        clone
+            .insert("one more key than the source had", IValue::NULL)
+            .unwrap();
+        assert_eq!(clone.len(), n as u32 + 1);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(clone.get(k), Some(&IValue::from(i as i64)));
+        }
+        assert_ne!(*clone, *source);
+    }
+
+    /// Keys of every representation: the empty key, inline keys (<= 7 bytes) and heap keys.
+    fn clone_keys(n: usize) -> Vec<IString> {
+        (0..n)
+            .map(|i| match i % 4 {
+                0 if i == 0 => IString::intern(""),
+                0 => IString::intern(&format!("s{i:06}")),
+                1 => IString::intern(&format!("k{i}")),
+                2 => IString::intern(&format!("e{i:07}")),
+                _ => IString::intern(&format!("heap_key_number_{i}")),
+            })
+            .collect()
+    }
+
+    /// Exact-sized sources (`len == capacity`, what compact parsing and `shrink_to_fit`
+    /// produce) are cloned by copying items and the bucket table; sources with spare capacity
+    /// are cloned by re-inserting. Both give an equal, independent object with a valid table,
+    /// with and without a table (<= 8 / > 8 / > 16 keys) and with nested values.
+    #[mockalloc::test]
+    fn clone_copies_exact_tables_and_rebuilds_the_rest() {
+        for n in [1usize, 2, 8, 9, 16, 17, 40, 100] {
+            let keys = clone_keys(n);
+            // Exact-sized: built into a capacity of exactly `n`.
+            let mut exact = IObject::with_capacity(n).unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                let value: IValue = if i % 3 == 0 {
+                    IValue::from(i as i64)
+                } else if i % 3 == 1 {
+                    IValue::from(format!("value number {i}").as_str())
+                } else {
+                    // Exact-sized as well, so the clone's footprint equals the source's.
+                    let mut inner = IObject::with_capacity(1).unwrap();
+                    inner.insert("inner", IValue::from(i as i64)).unwrap();
+                    inner.into()
+                };
+                exact.insert(k.clone(), value).unwrap();
+            }
+            assert_eq!(exact.capacity() as usize, n);
+            assert_eq!(has_table(exact.capacity()), n > 8);
+            let mut clone = exact.clone();
+            check_clone(&exact, &mut clone);
+            // The same through `IValue::clone`.
+            let as_value: IValue = exact.clone().into();
+            let value_clone = as_value.clone();
+            assert_eq!(value_clone, as_value);
+            let mut inner_clone = value_clone.into_object().unwrap();
+            check_clone(&exact, &mut inner_clone);
+
+            // Spare capacity: `remove` leaves `len < capacity`, so the clone re-inserts.
+            let mut spare = exact.clone();
+            assert_eq!(spare.remove(&keys[n / 2]), exact.get(&keys[n / 2]).cloned());
+            assert!(spare.len() < spare.capacity());
+            let clone = spare.clone();
+            assert_eq!(clone, spare);
+            assert_eq!(clone.len(), spare.len());
+            assert_eq!(clone.capacity(), spare.len());
+            for (k, v) in spare.iter() {
+                assert_eq!(clone.get(k.as_str()), Some(v));
+            }
+            assert_eq!(clone.get(&keys[n / 2]), None);
+            // `shrink_to_fit` makes it exact again, and the table copy applies.
+            spare.shrink_to_fit();
+            assert_eq!(spare.len(), spare.capacity());
+            let mut clone = spare.clone();
+            check_clone(&spare, &mut clone);
+        }
+        // The empty (static) object clones to an empty object.
+        let empty = IObject::new();
+        let clone = empty.clone();
+        assert_eq!(clone, empty);
+        assert_eq!(clone.capacity(), 0);
+        assert_eq!(clone.len(), 0);
+    }
+
+    /// Keys that collide into one cluster that wraps around the end of the table: the copied
+    /// table keeps the wrap-around layout, so lookups and removals in the clone still find
+    /// every resident.
+    #[mockalloc::test]
+    fn clone_copies_a_wrapping_collision_cluster() {
+        let cap = hash_capacity(20);
+        let mut keys = Vec::new();
+        for i in 0.. {
+            let key = IString::intern(&format!("collision_field_{i}"));
+            if hash_bucket(&key, cap) >= cap - 2 {
+                keys.push(key);
+                if keys.len() == 20 {
+                    break;
+                }
+            }
+        }
+        let mut exact = IObject::with_capacity(20).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            exact.insert(k.clone(), i as i64).unwrap();
+        }
+        assert_eq!(exact.capacity(), 20);
+        assert_eq!(exact.len(), 20);
+        let mut clone = exact.clone();
+        check_clone(&exact, &mut clone);
+    }
+
+    /// Compact parsing (the RedisJSON `JSON.SET` path) yields exact-sized objects, duplicates
+    /// included; their clones are equal, serialise to the same bytes and stand on their own.
+    #[test]
+    fn clone_of_compact_parsed_document() {
+        use crate::IValueDeserSeed;
+        use serde::de::DeserializeSeed;
+        let json = r#"{"":0,"a":1,"ab":2,"1234567":3,"12345678":4,"review_count":5,
+            "name":{"first":"n","last":"m"},"business_id":[1,2,3],"categories":[1.5,2.5],
+            "stars":9,"a very long key that is on the heap":10,
+            "dup":11,"dup":12,"id":13,"i":14,"city":15,"state":16,"address":17,
+            "small":{"x":1,"y":2,"x":3}}"#;
+        let mut de = serde_json::Deserializer::from_str(json);
+        let value = IValueDeserSeed::new(None)
+            .deserialize_compact_objects(&mut de)
+            .unwrap();
+        let source = value.as_object().unwrap();
+        assert_eq!(source.len(), source.capacity());
+        assert!(has_table(source.capacity()));
+        let small = source.get("small").unwrap().as_object().unwrap();
+        assert_eq!(small.len(), 2);
+        assert_eq!(small.len(), small.capacity());
+
+        let cloned = value.clone();
+        assert_eq!(cloned, value);
+        assert_eq!(
+            serde_json::to_string(&cloned).unwrap(),
+            serde_json::to_string(&value).unwrap()
+        );
+        assert_eq!(cloned.mem_allocated(), value.mem_allocated());
+        let mut clone = cloned.into_object().unwrap();
+        assert_eq!(clone.get("dup"), Some(&IValue::from(12)));
+        assert_eq!(
+            clone.get("small").unwrap().as_object().unwrap().get("x"),
+            Some(&IValue::from(3))
+        );
+        check_clone(source, &mut clone);
+    }
 }
