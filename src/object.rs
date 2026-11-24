@@ -339,8 +339,8 @@ impl<'a> SplitHeaderMut<'a> {
         }
 
         // Remove the entry from the table
-        let index =
-            mem::replace(self.table.get_unchecked_mut(bucket as usize), Bucket::EMPTY).index as usize;
+        let index = mem::replace(self.table.get_unchecked_mut(bucket as usize), Bucket::EMPTY).index
+            as usize;
 
         // Unshift any displaced buckets, so the table is valid again
         self.unshift(bucket);
@@ -354,7 +354,9 @@ impl<'a> SplitHeaderMut<'a> {
 
             // Update it to point to the location where that item will be
             // after we swap it.
-            self.table.get_unchecked_mut(bucket_to_update as usize).index = index as u32;
+            self.table
+                .get_unchecked_mut(bucket_to_update as usize)
+                .index = index as u32;
 
             // Swap the element to be removed to the back
             self.items.swap(index, last_index);
@@ -447,7 +449,9 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
             .find_bucket_impl::<false>(&key)
             .expect_err("unique insertion only finds vacant buckets");
         let index = self.push(key, value);
-        self.reborrow().split_mut().shift(vacancy.bucket, index, vacancy.distance);
+        self.reborrow()
+            .split_mut()
+            .shift(vacancy.bucket, index, vacancy.distance);
     }
     fn clear(&mut self) {
         // Clear the table
@@ -747,7 +751,9 @@ impl IObject {
             .0;
         // Small objects carry no hash table.
         let layout = if has_table(cap) {
-            layout.extend(Layout::array::<Bucket>(hash_capacity(cap))?)?.0
+            layout
+                .extend(Layout::array::<Bucket>(hash_capacity(cap))?)?
+                .0
         } else {
             layout
         };
@@ -878,7 +884,9 @@ impl IObject {
                 for (k, v) in old_obj {
                     if let Err(vacancy) = hd.split().find_bucket(&k) {
                         let index = hd.push(k, v);
-                        hd.reborrow().split_mut().shift(vacancy.bucket, index, vacancy.distance);
+                        hd.reborrow()
+                            .split_mut()
+                            .shift(vacancy.bucket, index, vacancy.distance);
                     }
                 }
             }
