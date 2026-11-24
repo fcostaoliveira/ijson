@@ -1014,6 +1014,57 @@ mod tests {
         value
     }
 
+    /// `header_len` is the byte length of the CBOR header ciborium writes for every argument
+    /// width (0, 1, 2, 4 and 8 extra bytes), checked against the real encoder at each boundary;
+    /// the 8-byte width is only reachable through a 4 GiB payload, so it is checked here.
+    #[test]
+    fn header_len_matches_the_encoder_at_every_width() {
+        let encoded_header_len = |n: usize| {
+            let mut encoder = ciborium_ll::Encoder::from(Vec::new());
+            encoder.push(ciborium_ll::Header::Array(Some(n))).unwrap();
+            encoder.into_inner().len()
+        };
+        for (n, expected) in [
+            (0usize, 1usize),
+            (1, 1),
+            (23, 1),
+            (24, 2),
+            (0xFF, 2),
+            (0x100, 3),
+            (0xFFFF, 3),
+            (0x1_0000, 5),
+            (0xFFFF_FFFF, 5),
+            (0x1_0000_0000, 9),
+            (u32::MAX as usize + 2, 9),
+            (usize::MAX, 9),
+        ] {
+            assert_eq!(header_len(n), expected, "n = {n:#x}");
+            assert_eq!(encoded_header_len(n), expected, "n = {n:#x}");
+        }
+        // The bounds built on it: text with and without the stream definition byte, and typed
+        // arrays, equal to the bytes the encoders write.
+        let short = IString::from("x".repeat(7).as_str());
+        let defined = IString::from("x".repeat(stream::MIN_DEFINED_LEN).as_str());
+        assert_eq!(text_bound::<false>(&short), 8);
+        assert_eq!(text_bound::<true>(&short), 8);
+        assert_eq!(text_bound::<false>(&defined), 9);
+        assert_eq!(text_bound::<true>(&defined), 10);
+        assert_eq!(
+            encode(&IValue::from(defined.clone())).len(),
+            text_bound::<false>(&defined)
+        );
+        let f64s: IValue = IArray::try_from(vec![1.5f64; 3]).unwrap().into();
+        assert_eq!(typed_bound(TAG_F64_LE, &[1.5f64; 3]), 2 + 2 + 24);
+        assert_eq!(encode(&f64s).len(), typed_bound(TAG_F64_LE, &[1.5f64; 3]));
+        let u8s: IValue = IArray::try_from(vec![1u8; 0x100]).unwrap().into();
+        // `TAG_U8` is 64, so its own header takes two bytes.
+        assert_eq!(typed_bound(TAG_U8, &[1u8; 0x100]), 2 + 3 + 0x100);
+        assert_eq!(encode(&u8s).len(), typed_bound(TAG_U8, &[1u8; 0x100]));
+        assert_eq!(typed_bound::<u64>(TAG_U64_LE, &[]), 2 + 1);
+        assert_eq!(size_bound::<false>(&IValue::NULL), 1);
+        assert_eq!(size_bound::<true>(&IValue::from(1)), 9);
+    }
+
     #[test]
     fn presized_encoding_matches_unreserved_bytes() {
         for value in [bound_fixture(true), bound_fixture(false)] {
