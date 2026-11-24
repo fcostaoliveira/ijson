@@ -1132,6 +1132,7 @@ impl IArray {
 
     /// Pushes a new item onto the back of the array with a specific floating-point type, potentially losing precision.
     /// If the item is not a number, it is pushed as is.
+    #[inline]
     pub(crate) fn push_with_fp_type(
         &mut self,
         item: impl Into<IValue>,
@@ -1172,7 +1173,37 @@ impl IArray {
         Ok(())
     }
 
+    /// Appends a finite `f64` straight into an `F64`-tagged, non-empty array, without building an
+    /// `IValue`. Returns `false` and does nothing in every other state (empty or static array, other
+    /// tag, non-finite value, allocation failure), so the caller takes the general
+    /// [`push`](Self::push) path, which owns the tag-selection and promotion rules and reports
+    /// errors. In the fast-path state the two are equivalent: `prepare_for_item` would find
+    /// `can_push_directly(F64)` true and `push` would unbox the same `f64` into the same slot.
+    /// Kept out of line on purpose: the caller is serde_json's per-element number dispatch, and the
+    /// integer arms next to it must stay as small as they are without this method (EXP-001d).
+    #[inline(never)]
+    pub(crate) fn push_f64_direct(&mut self, value: f64) -> bool {
+        if self.is_static()
+            || self.len() == 0
+            || !value.is_finite()
+            || self.header().type_tag() != ArrayTag::F64
+            || self.reserve(1).is_err()
+        {
+            return false;
+        }
+        // Safety: the array is F64-tagged, not static, and `reserve(1)` guaranteed room for one
+        // more element; `set_len` publishes it after the write.
+        unsafe {
+            let len = self.header().len();
+            let ptr = self.header_mut().raw_array_ptr_mut().cast::<f64>();
+            ptr.add(len as usize).write(value);
+            self.header_mut().set_len(len + 1);
+        }
+        true
+    }
+
     /// Pushes a new item onto the back of the array.
+    #[inline]
     pub fn push(&mut self, item: impl Into<IValue>) -> Result<(), IJsonError> {
         let item = item.into();
         self.prepare_for_item(&item)?;
@@ -2182,6 +2213,55 @@ mod tests {
         assert_eq!(header_max.type_tag(), ArrayTag::F64);
 
         assert_eq!(std::mem::size_of::<Header>(), 8);
+    }
+
+    #[test]
+    fn test_push_f64_direct_states() {
+        // Static / empty: refused, nothing changes.
+        let mut arr = IArray::new();
+        assert!(!arr.push_f64_direct(1.5));
+        assert_eq!(arr.len(), 0);
+        let mut arr = IArray::with_capacity(4).unwrap();
+        assert!(!arr.push_f64_direct(1.5));
+        assert_eq!(arr.len(), 0);
+        // Other tag: refused.
+        let mut arr = IArray::new();
+        arr.push(IValue::from(1i64)).unwrap();
+        assert!(!arr.push_f64_direct(1.5));
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.header().type_tag(), ArrayTag::I8);
+        // A float that f16 represents exactly tags the array F16: refused, as the boxed path would
+        // also have kept the narrow tag until a wider value arrives.
+        let mut arr = IArray::new();
+        arr.push(IValue::from(0.5f64)).unwrap();
+        assert_eq!(arr.header().type_tag(), ArrayTag::F16);
+        assert!(!arr.push_f64_direct(1.5));
+        assert_eq!(arr.len(), 1);
+        // F64-tagged and non-empty: appended, including across reallocations.
+        let mut arr = IArray::new();
+        arr.push(IValue::from(0.1f64)).unwrap();
+        assert_eq!(arr.header().type_tag(), ArrayTag::F64);
+        for i in 1..40 {
+            assert!(arr.push_f64_direct(i as f64 + 0.1));
+        }
+        assert_eq!(arr.len(), 40);
+        assert_eq!(arr.header().type_tag(), ArrayTag::F64);
+        match arr.as_slice() {
+            ArraySliceRef::F64(s) => {
+                assert!(s.iter().enumerate().all(|(i, v)| *v == i as f64 + 0.1))
+            }
+            other => panic!("expected F64 storage, got {other:?}"),
+        }
+        // Non-finite: refused, array untouched.
+        assert!(!arr.push_f64_direct(f64::NAN));
+        assert!(!arr.push_f64_direct(f64::INFINITY));
+        assert_eq!(arr.len(), 40);
+        // Heterogeneous array: refused (the boxed path keeps it heterogeneous).
+        let mut arr = IArray::new();
+        arr.push(IValue::from("x")).unwrap();
+        arr.push(IValue::from(1.5f64)).unwrap();
+        assert!(!arr.push_f64_direct(2.5));
+        assert_eq!(arr.len(), 2);
     }
 
     #[test]
