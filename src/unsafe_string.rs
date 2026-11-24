@@ -512,14 +512,20 @@ impl From<IString> for String {
 impl PartialEq for IString {
     fn eq(&self, other: &Self) -> bool {
         if self.0.raw_eq(&other.0) {
-            // if we have the same exact point we know they are equals.
+            // Same handle: same text (also covers two inline strings of the same text,
+            // whose handles are identical by construction).
             return true;
         }
-        // otherwise we need to compare the strings.
-        let s1 = self.as_str();
-        let s2 = other.as_str();
-        let res = s1 == s2;
-        res
+        // An inline handle is canonical: the length sits in the tag byte and the text in the
+        // other seven bytes, zero padded. No heap string holds seven bytes or fewer
+        // (`intern` inlines them and `defrag` keeps them inline), so two different handles of
+        // which at least one is inline cannot hold the same text.
+        if self.is_inline() || other.is_inline() {
+            return false;
+        }
+        // Two heap strings: the same text can live in two allocations while the cache is
+        // being reset or a value is being defragmented, so compare the bytes.
+        self.header().bytes() == other.header().bytes()
     }
 }
 
@@ -582,6 +588,11 @@ impl Debug for IString {
 
 impl<A: DefragAllocator> Defrag<A> for IString {
     fn defrag(mut self, defrag_allocator: &mut A) -> Self {
+        if self.is_inline() {
+            // Nothing is allocated for an inline string, and re-interning it through the
+            // allocator would create the heap copy of a short string that `eq` rules out.
+            return self;
+        }
         let new = Self::intern_with_allocator(self.as_str(), |layout| unsafe {
             defrag_allocator.alloc(layout)
         });
@@ -802,5 +813,131 @@ mod tests {
             // Both should point to the same inline data
             assert_eq!(original.0.ptr_usize(), cloned.0.ptr_usize());
         });
+    }
+
+    /// Every pair of representations `eq` can meet: inline/inline, inline/heap, heap/heap in the
+    /// same allocation and heap/heap in two allocations of the same text (cache reset, defrag).
+    #[test]
+    fn eq_agrees_with_the_text_in_every_representation() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        fn hash_of(s: &IString) -> u64 {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        }
+        let texts = [
+            "",
+            "a",
+            "b",
+            "ab",
+            "ba",
+            "a\0",
+            "abc",
+            "abd",
+            "1234567",
+            "1234568",
+            "123456",
+            "12345678",
+            "12345679",
+            "1234567\0",
+            "a long string on the heap",
+            "a long string on the heap!",
+        ];
+        let first: Vec<IString> = texts.iter().map(|t| IString::intern(t)).collect();
+        for (i, a) in first.iter().enumerate() {
+            for (j, b) in first.iter().enumerate() {
+                let same = texts[i] == texts[j];
+                assert_eq!(a == b, same, "{:?} vs {:?}", texts[i], texts[j]);
+                assert_eq!(
+                    a.cmp(b) == Ordering::Equal,
+                    same,
+                    "{:?} vs {:?}",
+                    texts[i],
+                    texts[j]
+                );
+                assert_eq!(
+                    *a == *texts[j],
+                    same,
+                    "{:?} vs str {:?}",
+                    texts[i],
+                    texts[j]
+                );
+                if same {
+                    assert_eq!(hash_of(a), hash_of(b));
+                }
+            }
+        }
+        // Inline strings of the same text share one handle; the handle differs between texts.
+        let (x, y) = (IString::intern("hello"), IString::intern("hello"));
+        assert!(x.is_inline() && x.0.raw_eq(&y.0));
+        assert!(!IString::intern("hellp").0.raw_eq(&x.0));
+        // The same heap text in two allocations (after a cache reset) still compares equal.
+        let long = IString::intern("heap text that outlives a cache reset");
+        crate::reinit_shared_string_cache();
+        let again = IString::intern("heap text that outlives a cache reset");
+        assert_ne!(long.as_ptr(), again.as_ptr());
+        assert!(!long.0.raw_eq(&again.0));
+        assert_eq!(long, again);
+        assert_eq!(hash_of(&long), hash_of(&again));
+        assert_ne!(
+            long,
+            IString::intern("heap text that outlives a cache reset!")
+        );
+        assert_eq!(long.cmp(&again), Ordering::Equal);
+    }
+
+    /// Defrag leaves an inline string in the handle, so no heap string of 7 bytes or fewer can
+    /// appear and a defragmented object still finds its short keys.
+    #[test]
+    fn defrag_keeps_inline_strings_inline() {
+        struct CountingAllocator(usize);
+        impl DefragAllocator for CountingAllocator {
+            unsafe fn realloc_ptr<T>(&mut self, ptr: *mut T, layout: Layout) -> *mut T {
+                let new_ptr = self.alloc(layout).cast::<T>();
+                copy_nonoverlapping(ptr.cast::<u8>(), new_ptr.cast::<u8>(), layout.size());
+                self.free(ptr, layout);
+                new_ptr
+            }
+            unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+                self.0 += 1;
+                alloc(layout)
+            }
+            unsafe fn free<T>(&mut self, ptr: *mut T, layout: Layout) {
+                dealloc(ptr.cast::<u8>(), layout)
+            }
+        }
+        let mut allocator = CountingAllocator(0);
+        for text in ["a", "id", "1234567"] {
+            let s = IString::intern(text);
+            let d = s.clone().defrag(&mut allocator);
+            assert!(d.is_inline(), "{text:?}");
+            assert!(d.0.raw_eq(&s.0), "{text:?}");
+            assert_eq!(d, s);
+            assert_eq!(d.as_str(), text);
+        }
+        assert_eq!(allocator.0, 0, "defrag allocated for an inline string");
+        // A heap string is still moved to the allocator's memory and stays equal. As in
+        // production, the cache is reset first; otherwise `defrag` finds the live entry and
+        // allocates nothing.
+        let s = IString::intern("12345678");
+        crate::reinit_shared_string_cache();
+        let d = s.clone().defrag(&mut allocator);
+        assert_eq!(allocator.0, 1);
+        assert!(!d.is_inline());
+        assert_eq!(d, s);
+        assert_eq!(d.as_str(), "12345678");
+        drop(d);
+        // An object with short and long keys, defragmented, still answers lookups by text.
+        let doc: crate::IValue =
+            crate::ijson!({"id": 1, "name": "n", "review_count": 3, "k": [1, 2]});
+        crate::reinit_shared_string_cache();
+        let moved = doc.clone().defrag(&mut allocator);
+        let obj = moved.as_object().unwrap();
+        assert_eq!(obj.get("id"), Some(&crate::IValue::from(1)));
+        assert_eq!(obj.get("review_count"), Some(&crate::IValue::from(3)));
+        assert_eq!(obj.get("name").unwrap().as_string().unwrap(), "n");
+        assert_eq!(obj.get("ids"), None);
+        assert_eq!(moved, doc);
     }
 }
