@@ -1726,7 +1726,8 @@ mod tests {
         assert_eq!(mem::size_of::<Bucket>(), BUCKET_BYTES);
         let bytes: [u8; BUCKET_BYTES] = unsafe { mem::transmute(Bucket::EMPTY) };
         assert_eq!(bytes, [EMPTY_BUCKET_BYTE; BUCKET_BYTES]);
-        assert_eq!(Bucket::EMPTY.index, u32::MAX);
+        let index = Bucket::EMPTY.index;
+        assert_eq!(index, u32::MAX);
         let mut obj = IObject::with_capacity(16).unwrap();
         obj.insert("k", IValue::NULL).unwrap();
         obj.clear();
