@@ -71,11 +71,13 @@ static mut STRING_CACHE: OnceLock<StringCache> = OnceLock::new();
 pub(crate) fn reinit_cache() {
     let s_c = get_cache_mut();
     match s_c {
-        StringCache::ThreadUnsafe(s_c) => *s_c = HashSet::new(),
+        // A fresh table, so the strings re-interned after a reinit (active defrag) do not reuse the
+        // old entries, presized to the old length so re-interning the same set does not re-grow it.
+        StringCache::ThreadUnsafe(s_c) => *s_c = HashSet::with_capacity(s_c.len()),
         StringCache::ThreadSafe(s_c) => {
             let mut s_c: std::sync::MutexGuard<'_, HashSet<WeakIString>> =
                 s_c.lock().expect("Mutex lock should succeed");
-            *s_c = HashSet::new();
+            *s_c = HashSet::with_capacity(s_c.len());
         }
     }
 }
@@ -131,6 +133,14 @@ impl CacheGuard {
         match self {
             CacheGuard::ThreadSafe(c_g) => c_g.remove(val),
             CacheGuard::ThreadUnsafe(c_g) => c_g.remove(val),
+        }
+    }
+
+    #[cfg(test)]
+    fn len_and_capacity(&self) -> (usize, usize) {
+        match self {
+            CacheGuard::ThreadSafe(c_g) => (c_g.len(), c_g.capacity()),
+            CacheGuard::ThreadUnsafe(c_g) => (c_g.len(), c_g.capacity()),
         }
     }
 
@@ -597,6 +607,35 @@ impl<A: DefragAllocator> Defrag<A> for IString {
 mod tests {
     use super::*;
     use mockalloc::record_allocs;
+
+    #[test]
+    fn reinit_presizes_the_new_cache_to_the_old_length() {
+        let held: Vec<IString> = (0..100)
+            .map(|i| {
+                IString::intern(&format!(
+                    "EXP-022: a string the defrag cycle re-interns {i:04}"
+                ))
+            })
+            .collect();
+        let (old_len, _) = get_cache_guard().len_and_capacity();
+        assert!(old_len >= held.len());
+        crate::reinit_shared_string_cache();
+        let (len, cap) = get_cache_guard().len_and_capacity();
+        assert_eq!(len, 0, "the reinit cache must start empty");
+        assert!(cap >= old_len, "capacity {cap} < old length {old_len}");
+        // Re-interning the same strings makes new copies and fills the presized table.
+        let again: Vec<IString> = held.iter().map(|s| IString::intern(s.as_str())).collect();
+        for (old, new) in held.iter().zip(&again) {
+            assert_ne!(old.0.ptr_usize(), new.0.ptr_usize());
+        }
+        assert_eq!(
+            get_cache_guard().len_and_capacity().1,
+            cap,
+            "re-interning re-grew the table"
+        );
+        drop(held);
+        drop(again);
+    }
 
     // The unit tests share one cache, which an earlier test may have initialized
     // without a lock, so this test runs again in a process of its own.
