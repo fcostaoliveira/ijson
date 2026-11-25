@@ -1109,9 +1109,14 @@ impl IObject {
         res.0
     }
     pub(crate) fn drop_impl(&mut self) {
-        self.clear();
         if !self.is_static() {
             unsafe {
+                // The bucket table is freed with the allocation below, so only the items are
+                // dropped; refilling the table first (what `clear` does) is wasted work here.
+                let mut hd = self.header_mut();
+                while hd.len() > 0 {
+                    hd.pop();
+                }
                 Self::dealloc(self.0.ptr().cast());
                 self.0.set_ref(&EMPTY_HEADER);
             }
