@@ -124,10 +124,15 @@ struct Bucket {
 
 const DISTANCE_SATURATED: u8 = u8::MAX;
 
+/// Every byte of an empty bucket, so a table is cleared with one `write_bytes`.
+const EMPTY_BUCKET_BYTE: u8 = 0xFF;
+
 impl Bucket {
+    /// An empty slot is all `EMPTY_BUCKET_BYTE`s: `index == u32::MAX` is what every reader
+    /// checks first, so the distance byte of an empty slot is never interpreted.
     const EMPTY: Self = Self {
         index: u32::MAX,
-        distance: 0,
+        distance: DISTANCE_SATURATED,
     };
 
     fn new(index: u32, distance: usize) -> Self {
@@ -454,10 +459,10 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
             .shift(vacancy.bucket, index, vacancy.distance);
     }
     fn clear(&mut self) {
-        // Clear the table
-        for item in self.reborrow().split_mut().table {
-            *item = Bucket::EMPTY;
-        }
+        // Clear the table: every empty bucket is all `EMPTY_BUCKET_BYTE`s, one memset.
+        let table = self.reborrow().split_mut().table;
+        // SAFETY: `table` is a live, exclusively borrowed slice of `Bucket`s.
+        unsafe { std::ptr::write_bytes(table.as_mut_ptr(), EMPTY_BUCKET_BYTE, table.len()) };
         // Drop the items
         while self.len() > 0 {
             // Safety: not empty
@@ -767,9 +772,8 @@ impl IObject {
             if has_table(cap) {
                 let mut hd_mut = ThinMut::new(hd);
                 let hash_ptr = hd_mut.hashes_ptr_mut();
-                for i in 0..hash_capacity(cap) {
-                    hash_ptr.add(i).write(Bucket::EMPTY);
-                }
+                // Every empty bucket is all `EMPTY_BUCKET_BYTE`s: one memset.
+                std::ptr::write_bytes(hash_ptr, EMPTY_BUCKET_BYTE, hash_capacity(cap));
             }
             Ok(hd)
         }
@@ -1713,6 +1717,21 @@ mod tests {
     fn saturated_probe_distances_stay_correct() {
         saturated_cluster_scenario(0);
         saturated_cluster_scenario(hash_capacity(300) - 1);
+    }
+
+    #[test]
+    fn empty_bucket_is_the_memset_pattern() {
+        // `alloc` and `clear` fill tables with `write_bytes(EMPTY_BUCKET_BYTE)`; the constant
+        // must stay byte-identical to `Bucket::EMPTY`.
+        assert_eq!(mem::size_of::<Bucket>(), BUCKET_BYTES);
+        let bytes: [u8; BUCKET_BYTES] = unsafe { mem::transmute(Bucket::EMPTY) };
+        assert_eq!(bytes, [EMPTY_BUCKET_BYTE; BUCKET_BYTES]);
+        assert_eq!(Bucket::EMPTY.index, u32::MAX);
+        let mut obj = IObject::with_capacity(16).unwrap();
+        obj.insert("k", IValue::NULL).unwrap();
+        obj.clear();
+        let hd = obj.header().split();
+        assert!(hd.table.iter().all(|b| *b == Bucket::EMPTY));
     }
 
     #[test]
