@@ -1384,6 +1384,19 @@ mod tests_defrag {
     }
 
     #[test]
+    fn test_defrag_keeps_inline_strings_inline() {
+        // Keys and values of at most 7 bytes are stored inside the handle; defrag must not give
+        // them a heap allocation (it used to re-intern every string through the cache).
+        let val = ijson!({"foo": "bar", "short": ["a", "bc", "1234567"], "": ""});
+        let defrag_val = val.clone();
+        let before = defrag_val.mem_allocated();
+        crate::reinit_shared_string_cache();
+        let defrag_val = defrag_val.defrag(&mut DummyDefragAllocator);
+        assert_eq!(val, defrag_val);
+        assert_eq!(defrag_val.mem_allocated(), before);
+    }
+
+    #[test]
     fn test_defrag_array() {
         test_defrag_generic(ijson!([1, 2, "bar"]));
     }

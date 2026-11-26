@@ -582,6 +582,11 @@ impl Debug for IString {
 
 impl<A: DefragAllocator> Defrag<A> for IString {
     fn defrag(mut self, defrag_allocator: &mut A) -> Self {
+        // Empty and inline strings own no allocation, so there is nothing to move. Re-interning
+        // them through `intern_with_allocator` would turn an inline string into a heap string.
+        if self.is_empty() || self.is_inline() {
+            return self;
+        }
         let new = Self::intern_with_allocator(self.as_str(), |layout| unsafe {
             defrag_allocator.alloc(layout)
         });
