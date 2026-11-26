@@ -582,12 +582,39 @@ impl Debug for IString {
 
 impl<A: DefragAllocator> Defrag<A> for IString {
     fn defrag(mut self, defrag_allocator: &mut A) -> Self {
-        let new = Self::intern_with_allocator(self.as_str(), |layout| unsafe {
-            defrag_allocator.alloc(layout)
-        });
-        self.drop_impl_with_deallocator(|ptr, layout| unsafe {
-            defrag_allocator.free(ptr, layout)
-        });
+        if self.is_empty() || self.is_inline() {
+            // Same result as the general path below takes for these (no cache entry to move).
+            let new = Self::intern_with_allocator(self.as_str(), |layout| unsafe {
+                defrag_allocator.alloc(layout)
+            });
+            self.drop_impl_with_deallocator(|ptr, layout| unsafe {
+                defrag_allocator.free(ptr, layout)
+            });
+            mem::forget(self);
+            return new;
+        }
+        // Intern the moved copy and release this reference under one cache lock, instead of
+        // locking once to intern and again when this reference turns out to be the last one.
+        let mut cache = get_cache_guard();
+        let new = cache
+            .get_or_insert(
+                self.as_str(),
+                Box::new(|s| WeakIString {
+                    ptr: unsafe {
+                        NonNull::new_unchecked(Self::alloc(s, |layout| defrag_allocator.alloc(layout)))
+                    },
+                }),
+            )
+            .upgrade();
+        let hd = self.header();
+        if hd.rc.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            // The cache entry for this text is `new`'s allocation, which is not this one (that
+            // one still had a reference), so there is no entry to remove: free the allocation.
+            Self::dealloc(unsafe { self.0.ptr().cast() }, |ptr, layout| unsafe {
+                defrag_allocator.free(ptr, layout)
+            });
+        }
+        drop(cache);
         mem::forget(self);
         new
     }
