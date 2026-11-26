@@ -143,6 +143,41 @@ impl<'a> SplitHeader<'a> {
         }
         Err(u32::MAX)
     }
+    // Lookup-only probe: the bucket (table mode) or item index (no-table mode) holding `key`.
+    //
+    // Unlike `find_bucket`, it never hashes a resident key. Robin Hood's early exit (stop at
+    // the first resident closer to its home than we are to ours) needs each resident's home
+    // bucket, i.e. a SipHash of its bytes per probe step. Scanning on to the first empty
+    // bucket finds the same entry, because every key lies between its home bucket and the
+    // next empty bucket; it only gives up the early exit on a miss. Callers that insert
+    // need `find_bucket`'s vacant position and keep using it.
+    fn find_occupied(&self, key: &IString) -> Option<u32> {
+        if !has_table(self.cap) {
+            return self
+                .items
+                .iter()
+                .position(|kvp| &kvp.key == key)
+                .map(|i| i as u32);
+        }
+        let hash_cap = hash_capacity(self.cap);
+        let mut bucket = hash_bucket(key, hash_cap);
+        unsafe {
+            for _ in 0..hash_cap {
+                let index = *self.table.get_unchecked(bucket);
+                if index == u32::MAX {
+                    return None;
+                }
+                if &self.items.get_unchecked(index as usize).key == key {
+                    return Some(bucket as u32);
+                }
+                bucket += 1;
+                if bucket == hash_cap {
+                    bucket = 0;
+                }
+            }
+        }
+        None
+    }
     // Safety: index must be in bounds
     unsafe fn find_bucket_from_index(&self, index: usize) -> u32 {
         // No-table mode: the "bucket" identifying an item is the item index itself.
@@ -1162,7 +1197,7 @@ impl ObjectIndex for &IString {
             return None;
         }
         let hd = v.header().split();
-        if let Ok(bucket) = hd.find_bucket(self) {
+        if let Some(bucket) = hd.find_occupied(self) {
             // Safety: Bucket index is valid
             unsafe {
                 let index = if has_table(hd.cap) {
@@ -1184,7 +1219,7 @@ impl ObjectIndex for &IString {
         } else {
             // Safety: not static
             let hd = unsafe { v.header_mut().split_mut() };
-            if let Ok(bucket) = hd.as_ref().find_bucket(self) {
+            if let Some(bucket) = hd.as_ref().find_occupied(self) {
                 // Safety: Bucket index is valid
                 unsafe {
                     let index = if has_table(hd.cap) {
@@ -1212,7 +1247,7 @@ impl ObjectIndex for &IString {
             // Safety: not static
             let mut hd = unsafe { v.header_mut() };
             let mut split = hd.reborrow().split_mut();
-            if let Ok(bucket) = split.as_ref().find_bucket(self) {
+            if let Some(bucket) = split.as_ref().find_occupied(self) {
                 // Safety: Bucket index is valid
                 unsafe {
                     split.remove_bucket(bucket);
