@@ -109,14 +109,12 @@ enum CacheGuard {
 }
 
 impl CacheGuard {
-    fn get_or_insert<'a>(
-        &mut self,
-        value: &str,
-        f: Box<dyn FnOnce(&str) -> WeakIString + 'a>,
-    ) -> &WeakIString {
+    // Generic over the constructor: a boxed `dyn FnOnce` would heap-allocate whenever the closure
+    // captures state (the defrag allocator), once per interned heap string.
+    fn get_or_insert<F: FnOnce(&str) -> WeakIString>(&mut self, value: &str, f: F) -> &WeakIString {
         match self {
-            CacheGuard::ThreadSafe(c_g) => c_g.get_or_insert_with(value, |val| f(val)),
-            CacheGuard::ThreadUnsafe(c_g) => c_g.get_or_insert_with(value, |val| f(val)),
+            CacheGuard::ThreadSafe(c_g) => c_g.get_or_insert_with(value, f),
+            CacheGuard::ThreadUnsafe(c_g) => c_g.get_or_insert_with(value, f),
         }
     }
 
@@ -272,12 +270,9 @@ impl IString {
 
         let mut cache = get_cache_guard();
 
-        let k = cache.get_or_insert(
-            s,
-            Box::new(|s| WeakIString {
-                ptr: unsafe { NonNull::new_unchecked(Self::alloc(s, allocator)) },
-            }),
-        );
+        let k = cache.get_or_insert(s, |s| WeakIString {
+            ptr: unsafe { NonNull::new_unchecked(Self::alloc(s, allocator)) },
+        });
         k.upgrade()
     }
 
