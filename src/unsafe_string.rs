@@ -109,10 +109,12 @@ enum CacheGuard {
 }
 
 impl CacheGuard {
-    fn get_or_insert<'a>(
+    // The constructor is borrowed, not boxed: a `Box<dyn FnOnce>` heap-allocates whenever the
+    // closure captures state (the defrag allocator), once per interned heap string.
+    fn get_or_insert(
         &mut self,
         value: &str,
-        f: Box<dyn FnOnce(&str) -> WeakIString + 'a>,
+        f: &mut dyn FnMut(&str) -> WeakIString,
     ) -> &WeakIString {
         match self {
             CacheGuard::ThreadSafe(c_g) => c_g.get_or_insert_with(value, |val| f(val)),
@@ -272,12 +274,14 @@ impl IString {
 
         let mut cache = get_cache_guard();
 
-        let k = cache.get_or_insert(
-            s,
-            Box::new(|s| WeakIString {
+        // `get_or_insert_with` calls the constructor at most once; `take` moves the allocator out.
+        let mut allocator = Some(allocator);
+        let k = cache.get_or_insert(s, &mut |s| {
+            let allocator = allocator.take().expect("string constructor called once");
+            WeakIString {
                 ptr: unsafe { NonNull::new_unchecked(Self::alloc(s, allocator)) },
-            }),
-        );
+            }
+        });
         k.upgrade()
     }
 
