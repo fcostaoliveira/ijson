@@ -404,6 +404,14 @@ impl<'a, T: ThinRefExt<'a, Header>> HeaderRef<'a> for T {}
 impl<'a> HeaderMut<'a> for ThinMut<'a, Header> {
     // Safety: Must ensure there's capacity for an extra element
     unsafe fn entry(self, key: IString) -> Entry<'a> {
+        // An occupied key is found without hashing residents; only an absent key pays the
+        // Robin Hood probe for its vacant position.
+        if let Some(bucket) = self.split().find_occupied(&key) {
+            return Entry::Occupied(OccupiedEntry {
+                header: self,
+                bucket,
+            });
+        }
         match self.split().find_bucket(&key) {
             Err(bucket) => Entry::Vacant(VacantEntry {
                 header: self,
@@ -418,6 +426,12 @@ impl<'a> HeaderMut<'a> for ThinMut<'a, Header> {
     }
     // Safety: Must ensure there's capacity for an extra element
     unsafe fn entry_or_clone(self, key: &IString) -> Entry<'a> {
+        if let Some(bucket) = self.split().find_occupied(key) {
+            return Entry::Occupied(OccupiedEntry {
+                header: self,
+                bucket,
+            });
+        }
         match self.split().find_bucket(key) {
             Err(bucket) => Entry::Vacant(VacantEntry {
                 header: self,
@@ -854,7 +868,7 @@ impl IObject {
         let key = key.into();
         // A full object only needs to grow if the key is absent.
         if self.len() == self.capacity() {
-            if let Ok(bucket) = self.header().split().find_bucket(&key) {
+            if let Some(bucket) = self.header().split().find_occupied(&key) {
                 return Ok(Entry::Occupied(OccupiedEntry {
                     // SAFETY: finding an occupied entry proves the object is non-static.
                     header: unsafe { self.header_mut() },
@@ -874,7 +888,7 @@ impl IObject {
     pub fn entry_or_clone(&mut self, key: &IString) -> Result<Entry<'_>, IJsonError> {
         // Reuse the occupied bucket instead of reserving or probing a second time.
         if self.len() == self.capacity() {
-            if let Ok(bucket) = self.header().split().find_bucket(key) {
+            if let Some(bucket) = self.header().split().find_occupied(key) {
                 return Ok(Entry::Occupied(OccupiedEntry {
                     // SAFETY: finding an occupied entry proves the object is non-static.
                     header: unsafe { self.header_mut() },
