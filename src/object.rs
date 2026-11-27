@@ -77,14 +77,17 @@ fn hash_capacity(cap: u32) -> usize {
     cap as usize + cap as usize / 4
 }
 
-fn hash_fn(s: &IString) -> usize {
+fn hash_fn(s: &IString) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.as_str().hash(&mut hasher);
-    hasher.finish() as usize
+    hasher.finish()
 }
 
 fn hash_bucket(s: &IString, hash_cap: usize) -> usize {
-    hash_fn(s) % hash_cap
+    // Multiply-shift range reduction (Lemire, "A fast alternative to the modulo reduction"):
+    // maps the 64-bit hash onto `0..hash_cap` with one widening multiply instead of a
+    // 64-bit division. Uses the hash's high bits, which SipHash mixes as well as the low ones.
+    ((u128::from(hash_fn(s)) * hash_cap as u128) >> 64) as usize
 }
 
 struct SplitHeader<'a> {
