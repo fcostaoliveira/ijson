@@ -120,6 +120,20 @@ impl CacheGuard {
         }
     }
 
+    // Defrag's constructor captures the defrag allocator, so boxing it (as `get_or_insert`
+    // does) would heap-allocate once per string. Generic instead; only defrag uses it, so
+    // the `intern` path keeps its code.
+    fn get_or_insert_generic<F: FnOnce(&str) -> WeakIString>(
+        &mut self,
+        value: &str,
+        f: F,
+    ) -> &WeakIString {
+        match self {
+            CacheGuard::ThreadSafe(c_g) => c_g.get_or_insert_with(value, f),
+            CacheGuard::ThreadUnsafe(c_g) => c_g.get_or_insert_with(value, f),
+        }
+    }
+
     fn get_val(&self, val: &str) -> Option<&WeakIString> {
         match self {
             CacheGuard::ThreadSafe(c_g) => c_g.get(val),
@@ -278,6 +292,20 @@ impl IString {
                 ptr: unsafe { NonNull::new_unchecked(Self::alloc(s, allocator)) },
             }),
         );
+        k.upgrade()
+    }
+
+    // `intern_with_allocator` for defrag: the same lookup, without boxing the constructor.
+    fn intern_for_defrag<A: FnOnce(Layout) -> *mut u8>(s: &str, allocator: A) -> Self {
+        if s.is_empty() {
+            return Self::new();
+        }
+
+        let mut cache = get_cache_guard();
+
+        let k = cache.get_or_insert_generic(s, |s| WeakIString {
+            ptr: unsafe { NonNull::new_unchecked(Self::alloc(s, allocator)) },
+        });
         k.upgrade()
     }
 
@@ -582,7 +610,7 @@ impl Debug for IString {
 
 impl<A: DefragAllocator> Defrag<A> for IString {
     fn defrag(mut self, defrag_allocator: &mut A) -> Self {
-        let new = Self::intern_with_allocator(self.as_str(), |layout| unsafe {
+        let new = Self::intern_for_defrag(self.as_str(), |layout| unsafe {
             defrag_allocator.alloc(layout)
         });
         self.drop_impl_with_deallocator(|ptr, layout| unsafe {
